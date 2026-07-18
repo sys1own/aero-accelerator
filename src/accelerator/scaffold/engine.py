@@ -1,0 +1,558 @@
+"""Generate a self-contained Rust/PyO3 crate from an annotated HIN graph."""
+
+from __future__ import annotations
+
+import ast
+import re
+import tempfile
+from importlib import resources
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+
+class UnsupportedError(ValueError):
+    """Raised when the source contains constructs we cannot compile."""
+
+
+class Engine:
+    """Write a Rust source crate for the function described by ``annotated_graph``."""
+
+    def generate(
+        self,
+        annotated_graph: Any,
+        output_dir: Path,
+        *,
+        module_name: str,
+        function_name: str,
+        source: str,
+    ) -> Path:
+        """Create a temporary crate, write Cargo.toml and src/lib.rs, and return its path."""
+        traits = getattr(annotated_graph, "traits", {})
+        crate_root = Path(tempfile.mkdtemp(prefix="accelerator-crate-"))
+        src_dir = crate_root / "src"
+        src_dir.mkdir(parents=True)
+
+        tree = ast.parse(source)
+        func = _find_function(tree, function_name)
+        if func is None:
+            raise UnsupportedError(f"Function {function_name!r} not found in source")
+
+        generator = RustGenerator(func, module_name, traits)
+        cargo_toml, lib_rs = generator.emit()
+
+        (crate_root / "Cargo.toml").write_text(cargo_toml, encoding="utf-8")
+        (src_dir / "lib.rs").write_text(lib_rs, encoding="utf-8")
+
+        return crate_root
+
+
+class RustGenerator:
+    """Convert a Python numeric function into a Rust PyO3 extension."""
+
+    IO_MODULES = {
+        "requests",
+        "urllib",
+        "socket",
+        "os",
+        "subprocess",
+        "pathlib",
+        "io",
+        "ftplib",
+        "http",
+        "sys",
+    }
+    IO_NAMES = {
+        "open",
+        "print",
+        "input",
+        "exec",
+        "eval",
+        "compile",
+        "exit",
+        "quit",
+        "__import__",
+    }
+    MATH_ATTRS = {
+        "sqrt",
+        "sin",
+        "cos",
+        "tan",
+        "exp",
+        "log",
+        "log10",
+        "ceil",
+        "floor",
+        "trunc",
+        "pow",
+    }
+
+    def __init__(
+        self,
+        func: ast.FunctionDef,
+        module_name: str,
+        traits: Dict[str, Any],
+    ):
+        self.func = func
+        self.module_name = _rust_identifier(module_name)
+        self.crate_name = self.module_name
+        self.traits = traits
+        self.function_type = traits.get("function_type", "i64")
+        self.return_type = traits.get("return_type", self.function_type)
+
+        arg_names = [a.arg for a in func.args.args]
+        arg_types = traits.get("arg_types") or [self.function_type] * len(arg_names)
+        if len(arg_types) != len(arg_names):
+            arg_types = [self.function_type] * len(arg_names)
+        self.arg_names = arg_names
+        self.arg_types = arg_types
+
+        self.assigned = self._collect_assigned()
+        self._tmp_counter = 0
+
+    def emit(self) -> tuple[str, str]:
+        function_code = self._emit_function()
+        cargo_template = resources.files("accelerator.templates").joinpath("Cargo.toml").read_text()
+        lib_template = resources.files("accelerator.templates").joinpath("lib.rs").read_text()
+
+        shield_traits = self.traits.get("traits", ["Integer"])
+        shield_imports = "\n".join(
+            ["#[allow(unused_imports)]"]
+            + [f"use rug::{t};" for t in shield_traits]
+        )
+
+        cargo = cargo_template.format(crate_name=self.crate_name)
+        lib = lib_template.format(
+            shield_imports=shield_imports,
+            function_code=function_code,
+            module_name=self.module_name,
+            function_name=self.func.name,
+        )
+        return cargo, lib
+
+    # ------------------------------------------------------------------
+    # Collection helpers
+    # ------------------------------------------------------------------
+    def _collect_assigned(self) -> set[str]:
+        names: set[str] = set()
+        for node in ast.walk(self.func):
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                for target in node.targets:
+                    names.update(_names_in_target(target))
+            elif isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
+                names.add(node.target.id)
+        return names
+
+    def _zero(self) -> str:
+        return "0.0_f64" if self.function_type == "f64" else "0_i64"
+
+    def _next_tmp(self) -> str:
+        self._tmp_counter += 1
+        return f"_accel_tmp{self._tmp_counter}"
+
+    @staticmethod
+    def _strip_outer_parens(expr: str) -> str:
+        while len(expr) >= 2 and expr[0] == "(" and expr[-1] == ")":
+            depth = 0
+            match_index = -1
+            for i, ch in enumerate(expr):
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        match_index = i
+                        break
+            if match_index == len(expr) - 1:
+                expr = expr[1:-1]
+            else:
+                break
+        return expr
+
+    # ------------------------------------------------------------------
+    # Statement emission
+    # ------------------------------------------------------------------
+    def _emit_function(self) -> str:
+        args = f", ".join(
+            f"{name}: {typ}" for name, typ in zip(self.arg_names, self.arg_types)
+        )
+        header = f"#[pyfunction]\nfn {self.func.name}({args}) -> {self.return_type} {{"
+
+        defaults: List[str] = []
+        for name in sorted(self.assigned):
+            if name in self.arg_names:
+                defaults.append(f"let mut {name} = {name};")
+            else:
+                defaults.append(f"let mut {name} = {self._zero()};")
+
+        body_lines = [self._emit_stmt(stmt) for stmt in self.func.body]
+        body = "\n".join(defaults + body_lines)
+        indented = "\n".join("    " + line for line in body.splitlines())
+        return f"{header}\n{indented}\n}}"
+
+    def _emit_stmt(self, stmt: ast.stmt) -> str:
+        if isinstance(stmt, ast.Return):
+            if stmt.value is None:
+                return "return;"
+            value = self._strip_outer_parens(
+                self._emit_expr(stmt.value, self.function_type)
+            )
+            return f"return {value};"
+        if isinstance(stmt, ast.Assign):
+            return self._emit_assign(stmt)
+        if isinstance(stmt, ast.AugAssign):
+            return self._emit_augassign(stmt)
+        if isinstance(stmt, ast.If):
+            return self._emit_if(stmt)
+        if isinstance(stmt, ast.While):
+            return self._emit_while(stmt)
+        if isinstance(stmt, ast.For):
+            return self._emit_for(stmt)
+        if isinstance(stmt, ast.Pass):
+            return ""
+        if isinstance(stmt, ast.Expr):
+            # Stand-alone expressions are not meaningful for numeric math.
+            return ""
+        raise UnsupportedError(f"Unsupported statement: {type(stmt).__name__}")
+
+    def _emit_assign(self, stmt: ast.Assign) -> str:
+        if len(stmt.targets) == 1:
+            target = stmt.targets[0]
+            if isinstance(target, ast.Name):
+                name = target.id
+                return f"{name} = {self._emit_expr(stmt.value, self.function_type)};"
+            if isinstance(target, (ast.Tuple, ast.List)):
+                return self._emit_tuple_unpack(target, stmt.value)
+
+        raise UnsupportedError("Only single-target or tuple unpacking assignments are supported")
+
+    def _emit_tuple_unpack(self, target: ast.AST, value: ast.expr) -> str:
+        names = _names_in_target(target)
+        if len(names) != len(_elements(target)):
+            raise UnsupportedError("Only plain names may appear in a tuple unpack")
+        if not isinstance(value, (ast.Tuple, ast.List)):
+            raise UnsupportedError("Tuple unpack requires a tuple/list on the right")
+
+        elements = [
+            self._emit_expr(e, self.function_type) for e in _elements(value)
+        ]
+        tmp = self._next_tmp()
+        lines = [f"let {tmp} = ({', '.join(elements)});"]
+        for i, name in enumerate(names):
+            lines.append(f"{name} = {tmp}.{i};")
+        return "\n".join(lines)
+
+    def _emit_augassign(self, stmt: ast.AugAssign) -> str:
+        if not isinstance(stmt.target, ast.Name):
+            raise UnsupportedError("Only simple names may be used in augmented assignment")
+        name = stmt.target.id
+        fake = ast.BinOp(
+            left=ast.Name(id=name, ctx=ast.Load()),
+            op=stmt.op,
+            right=stmt.value,
+        )
+        return f"{name} = {self._emit_binop(fake, self.function_type)};"
+
+    def _emit_if(self, stmt: ast.If) -> str:
+        cond = self._strip_outer_parens(self._emit_expr(stmt.test, "bool"))
+        then_body = self._emit_body(stmt.body)
+
+        parts = [f"if {cond} {{\n{then_body}\n}}"]
+        orelse = stmt.orelse
+        while orelse and len(orelse) == 1 and isinstance(orelse[0], ast.If):
+            inner = orelse[0]
+            inner_cond = self._strip_outer_parens(self._emit_expr(inner.test, "bool"))
+            inner_body = self._emit_body(inner.body)
+            parts.append(f"else if {inner_cond} {{\n{inner_body}\n}}")
+            orelse = inner.orelse
+
+        if orelse:
+            else_body = self._emit_body(orelse)
+            parts.append(f"else {{\n{else_body}\n}}")
+
+        return " ".join(parts)
+
+    def _emit_while(self, stmt: ast.While) -> str:
+        cond = self._strip_outer_parens(self._emit_expr(stmt.test, "bool"))
+        body = self._emit_body(stmt.body)
+        return f"while {cond} {{\n{body}\n}}"
+
+    def _emit_for(self, stmt: ast.For) -> str:
+        if not isinstance(stmt.target, ast.Name):
+            raise UnsupportedError("Only a single loop variable is supported")
+        if not isinstance(stmt.iter, ast.Call):
+            raise UnsupportedError("Only range(...) loops are supported")
+        call = stmt.iter
+        if _call_name(call) != "range":
+            raise UnsupportedError("Only range(...) loops are supported")
+        if len(call.args) == 1:
+            stop = self._emit_expr(call.args[0], self.function_type)
+            range_expr = f"0..{stop}"
+        elif len(call.args) == 2:
+            start = self._emit_expr(call.args[0], self.function_type)
+            stop = self._emit_expr(call.args[1], self.function_type)
+            range_expr = f"{start}..{stop}"
+        else:
+            raise UnsupportedError("range(...) with step is not supported")
+        body = self._emit_body(stmt.body)
+        return f"for {stmt.target.id} in {range_expr} {{\n{body}\n}}"
+
+    def _emit_body(self, stmts: List[ast.stmt]) -> str:
+        lines = [self._emit_stmt(s) for s in stmts]
+        joined = "\n".join(line for line in lines if line)
+        return "\n".join("    " + line for line in joined.splitlines())
+
+    # ------------------------------------------------------------------
+    # Expression emission
+    # ------------------------------------------------------------------
+    def _emit_expr(self, expr: ast.expr, ctx: str) -> str:
+        if isinstance(expr, ast.Constant):
+            return self._emit_constant(expr, ctx)
+        if isinstance(expr, ast.Name):
+            return expr.id
+        if isinstance(expr, ast.BinOp):
+            return self._emit_binop(expr, ctx)
+        if isinstance(expr, ast.UnaryOp):
+            return self._emit_unaryop(expr, ctx)
+        if isinstance(expr, ast.Compare):
+            return self._emit_compare(expr, ctx)
+        if isinstance(expr, ast.BoolOp):
+            return self._emit_boolop(expr, ctx)
+        if isinstance(expr, ast.Call):
+            return self._emit_call(expr, ctx)
+        if isinstance(expr, ast.IfExp):
+            return self._emit_ifexp(expr, ctx)
+        if isinstance(expr, (ast.Tuple, ast.List)):
+            return f"({', '.join(self._emit_expr(e, ctx) for e in expr.elts)})"
+        if isinstance(expr, ast.Subscript):
+            raise UnsupportedError("Subscript/indexing is not supported")
+        raise UnsupportedError(f"Unsupported expression: {type(expr).__name__}")
+
+    def _emit_constant(self, expr: ast.Constant, ctx: str) -> str:
+        value = expr.value
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, (int, float)):
+            if ctx == "f64":
+                if isinstance(value, float):
+                    return f"{value}_f64"
+                return f"{value}_f64"
+            if isinstance(value, float):
+                raise UnsupportedError("Float literal in an integer-typed function")
+            return f"{value}_i64"
+        if value is None:
+            raise UnsupportedError("None is not a numeric value")
+        raise UnsupportedError(f"Unsupported literal: {value!r}")
+
+    def _emit_unaryop(self, expr: ast.UnaryOp, ctx: str) -> str:
+        operand = self._emit_expr(expr.operand, ctx)
+        if isinstance(expr.op, ast.UAdd):
+            return operand
+        if isinstance(expr.op, (ast.USub, ast.Invert)):
+            return f"-({operand})"
+        if isinstance(expr.op, ast.Not):
+            return f"!({operand})"
+        raise UnsupportedError(f"Unsupported unary operator: {type(expr.op).__name__}")
+
+    def _emit_binop(self, expr: ast.BinOp, ctx: str) -> str:
+        left = self._emit_expr(expr.left, ctx)
+        right = self._emit_expr(expr.right, ctx)
+        op = expr.op
+
+        if isinstance(op, ast.Add):
+            return f"({left} + {right})"
+        if isinstance(op, ast.Sub):
+            return f"({left} - {right})"
+        if isinstance(op, ast.Mult):
+            return f"({left} * {right})"
+        if isinstance(op, ast.Div):
+            return f"({left} / {right})"
+        if isinstance(op, ast.FloorDiv):
+            if ctx == "f64":
+                return f"(({left}) / ({right})).floor()"
+            return f"({left}).div_euclid({right})"
+        if isinstance(op, ast.Mod):
+            if ctx == "f64":
+                return f"(({left}) % ({right}))"
+            return f"({left}).rem_euclid({right})"
+        if isinstance(op, ast.Pow):
+            if ctx == "f64":
+                return f"({left}).powf({right})"
+            return f"({left}).pow(({right}) as u32)"
+        if isinstance(op, ast.LShift):
+            return f"({left} << {right})"
+        if isinstance(op, ast.RShift):
+            return f"({left} >> {right})"
+        if isinstance(op, ast.BitOr):
+            return f"({left} | {right})"
+        if isinstance(op, ast.BitXor):
+            return f"({left} ^ {right})"
+        if isinstance(op, ast.BitAnd):
+            return f"({left} & {right})"
+
+        raise UnsupportedError(f"Unsupported binary operator: {type(op).__name__}")
+
+    def _emit_compare(self, expr: ast.Compare, ctx: str) -> str:
+        if len(expr.ops) != 1 or len(expr.comparators) != 1:
+            raise UnsupportedError("Only simple binary comparisons are supported")
+        left = self._emit_expr(expr.left, ctx)
+        right = self._emit_expr(expr.comparators[0], ctx)
+        op = expr.ops[0]
+        op_str = {
+            ast.Eq: "==",
+            ast.NotEq: "!=",
+            ast.Lt: "<",
+            ast.LtE: "<=",
+            ast.Gt: ">",
+            ast.GtE: ">=",
+        }.get(type(op))
+        if op_str is None:
+            raise UnsupportedError(f"Unsupported comparison: {type(op).__name__}")
+        return f"({left} {op_str} {right})"
+
+    def _emit_boolop(self, expr: ast.BoolOp, ctx: str) -> str:
+        op = " && " if isinstance(expr.op, ast.And) else " || "
+        parts = [self._emit_expr(v, ctx) for v in expr.values]
+        return f"({op.join(parts)})"
+
+    def _emit_ifexp(self, expr: ast.IfExp, ctx: str) -> str:
+        cond = self._emit_expr(expr.test, "bool")
+        body = self._emit_expr(expr.body, ctx)
+        orelse = self._emit_expr(expr.orelse, ctx)
+        return f"if {cond} {{ {body} }} else {{ {orelse} }}"
+
+    def _emit_call(self, expr: ast.Call, ctx: str) -> str:
+        name = _call_name(expr)
+        base = _call_base(expr)
+        args = [
+            self._strip_outer_parens(self._emit_expr(a, self.function_type))
+            for a in expr.args
+        ]
+
+        if base is None and name == self.func.name:
+            if len(args) != len(self.arg_names):
+                raise UnsupportedError(
+                    f"Recursive call to {name} has wrong number of arguments"
+                )
+            return f"{name}({', '.join(args)})"
+
+        if base is None and name in {"abs", "round"}:
+            if len(args) != 1:
+                raise UnsupportedError(f"{name}() takes exactly one argument")
+            arg = args[0]
+            if name == "abs":
+                return f"({arg}).abs()"
+            if ctx == "f64":
+                return f"({arg}).round()"
+            return f"(({arg} as f64).round() as i64)"
+
+        if base is None and name == "pow":
+            if len(args) != 2:
+                raise UnsupportedError("pow() takes exactly two arguments")
+            left, right = args
+            if ctx == "f64":
+                return f"({left}).powf({right})"
+            return f"({left}).pow(({right}) as u32)"
+
+        if base is None and name in {"min", "max"}:
+            if not args:
+                raise UnsupportedError(f"{name}() requires at least one argument")
+            method = "min" if name == "min" else "max"
+            result = f"({args[0]})"
+            for a in args[1:]:
+                result = f"({result}.{method}({a}))"
+            return result
+
+        if base == "math" and name in self.MATH_ATTRS:
+            return self._emit_math_call(name, args, ctx)
+
+        if base in self.IO_MODULES or name in self.IO_NAMES:
+            raise UnsupportedError("io")
+        raise UnsupportedError(f"Unsupported call: {name}")
+
+    def _emit_math_call(self, name: str, args: List[str], ctx: str) -> str:
+        if name == "pow":
+            if len(args) != 2:
+                raise UnsupportedError("math.pow() takes exactly two arguments")
+            left, right = args
+            if ctx == "f64":
+                return f"({left}).powf({right})"
+            return f"(({left} as f64).powf({right} as f64) as i64)"
+
+        if len(args) != 1:
+            raise UnsupportedError(f"math.{name}() takes exactly one argument")
+        arg = args[0]
+        rust_method = {
+            "sqrt": "sqrt",
+            "sin": "sin",
+            "cos": "cos",
+            "tan": "tan",
+            "exp": "exp",
+            "log": "ln",
+            "log10": "log10",
+            "ceil": "ceil",
+            "floor": "floor",
+            "trunc": "trunc",
+        }[name]
+
+        if ctx == "f64":
+            return f"({arg}).{rust_method}()"
+        return f"(({arg} as f64).{rust_method}() as i64)"
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _find_function(tree: ast.AST, name: str) -> Optional[ast.FunctionDef]:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    return None
+
+
+def _names_in_target(target: ast.expr) -> List[str]:
+    names: List[str] = []
+    if isinstance(target, ast.Name):
+        names.append(target.id)
+    elif isinstance(target, (ast.Tuple, ast.List)):
+        for elt in target.elts:
+            names.extend(_names_in_target(elt))
+    return names
+
+
+def _elements(container: ast.expr) -> List[ast.expr]:
+    if isinstance(container, (ast.Tuple, ast.List)):
+        return list(container.elts)
+    return []
+
+
+def _call_name(expr: ast.Call) -> str:
+    if isinstance(expr.func, ast.Name):
+        return expr.func.id
+    if isinstance(expr.func, ast.Attribute):
+        return expr.func.attr
+    return ""
+
+
+def _call_base(expr: ast.Call) -> Optional[str]:
+    if isinstance(expr.func, ast.Attribute) and isinstance(expr.func.value, ast.Name):
+        return expr.func.value.id
+    return None
+
+
+_RUST_KEYWORDS = {
+    "as", "break", "const", "continue", "crate", "else", "enum", "extern",
+    "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod",
+    "move", "mut", "pub", "ref", "return", "self", "Self", "static", "struct",
+    "super", "trait", "true", "type", "unsafe", "use", "where", "while",
+    "dyn", "async", "await", "abstract", "become", "box", "do", "final",
+    "macro", "override", "priv", "typeof", "unsized", "virtual", "yield",
+}
+
+
+def _rust_identifier(name: str) -> str:
+    sanitized = re.sub(r"[^0-9a-zA-Z_]", "_", name)
+    if not sanitized:
+        sanitized = "module"
+    if sanitized[0].isdigit() or sanitized in _RUST_KEYWORDS:
+        sanitized = "a_" + sanitized
+    return sanitized
