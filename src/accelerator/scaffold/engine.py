@@ -146,19 +146,58 @@ class RustGenerator:
                 return True
         return False
 
+    def _is_mutable(self, name: str) -> bool:
+        """Return True if ``name`` is assigned more than once or inside a loop."""
+        count = self._count_targets_in_body(name, self.func.body, in_loop=False)
+        if name in self.arg_names:
+            # The parameter is the first binding; any target assignment is a
+            # reassignment, so the local shadow needs to be mutable.
+            return count > 0
+        return count > 1
+
+    def _count_targets_in_body(
+        self, name: str, stmts: List[ast.stmt], in_loop: bool
+    ) -> int:
+        return sum(self._count_targets(name, stmt, in_loop) for stmt in stmts)
+
+    def _count_targets(self, name: str, stmt: ast.stmt, in_loop: bool) -> int:
+        if isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+            for target in stmt.targets:
+                if name in _names_in_target(target):
+                    # An assignment inside a loop may execute multiple times.
+                    return 2 if in_loop else 1
+            return 0
+        if isinstance(stmt, ast.AugAssign) and isinstance(stmt.target, ast.Name):
+            if stmt.target.id == name:
+                return 2 if in_loop else 1
+            return 0
+        if isinstance(stmt, ast.If):
+            return self._count_targets_in_body(
+                name, stmt.body, in_loop
+            ) + self._count_targets_in_body(name, stmt.orelse, in_loop)
+        if isinstance(stmt, (ast.For, ast.While)):
+            return self._count_targets_in_body(
+                name, stmt.body, in_loop=True
+            ) + self._count_targets_in_body(name, stmt.orelse, in_loop=True)
+        return 0
+
     def _initializers_and_body(self) -> Tuple[List[str], List[ast.stmt]]:
-        """Return `let mut` declarations and the remaining body statements.
+        """Return `let` declarations and the remaining body statements.
 
         Non-argument variables that are assigned a non-self-referential value
         on their first top-level assignment are initialized directly, avoiding
-        a zeroed dummy declaration followed by an immediate overwrite.
+        a zeroed dummy declaration followed by an immediate overwrite. The
+        ``mut`` keyword is omitted when the variable is never assigned again.
         """
         defaults: List[str] = []
         body = list(self.func.body)
 
         for name in sorted(self.assigned):
+            mutable = self._is_mutable(name)
+            mut = "mut " if mutable else ""
+
             if name in self.arg_names:
-                defaults.append(f"let mut {name} = {name};")
+                defaults.append(f"let {mut}{name} = {name};")
                 continue
 
             for i, stmt in enumerate(body):
@@ -172,14 +211,14 @@ class RustGenerator:
                     value = self._strip_outer_parens(
                         self._emit_expr(stmt.value, self.function_type)
                     )
-                    defaults.append(f"let mut {name} = {value};")
+                    defaults.append(f"let {mut}{name} = {value};")
                     body.pop(i)
                     break
             else:
                 # No top-level initializer; declare uninitialized. The first
                 # real assignment will initialize the variable, which avoids
                 # an "assigned value is never read" warning on a dummy zero.
-                defaults.append(f"let mut {name};")
+                defaults.append(f"let {mut}{name};")
 
         return defaults, body
 
@@ -288,8 +327,8 @@ class RustGenerator:
 
         elements = [self._emit_expr(e, self.function_type) for e in _elements(value)]
         tmp = self._next_tmp()
-        tuple_expr = self._strip_outer_parens(f"({', '.join(elements)})")
-        lines = [f"let {tmp} = {tuple_expr};"]
+        # The parentheses here form a Rust tuple literal, so we keep them.
+        lines = [f"let {tmp} = ({', '.join(elements)});"]
         for i, name in enumerate(names):
             lines.append(f"{name} = {tmp}.{i};")
         return "\n".join(lines)
