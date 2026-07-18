@@ -1,14 +1,14 @@
 # Aero-Accelerator
 
-**Aero-Accelerator** is a high-performance, graph-based JIT compiler designed to bridge the gap between Python and Rust. It transpiles numeric Python functions into native Rust extension modules, giving your code a significant speed boost while maintaining the familiar Python interface.
+**Aero-Accelerator** is a high-performance, graph-based JIT compiler designed to bridge the gap between Python and Rust[cite: 2]. It transpiles numeric Python functions into native Rust extension modules, giving your code a significant speed boost while maintaining the familiar Python interface[cite: 2].
 
-The generated artifacts (`.so`, `.dylib`, or `.pyd`) act as drop-in replacements for your original modules, allowing for seamless integration into existing pipelines.
+The generated artifacts (`.so`, `.dylib`, or `.pyd`) act as drop-in replacements for your original modules, allowing for seamless integration into existing pipelines[cite: 2].
 
 ---
 
 ## Quick Start
 
-Getting started is straightforward. To compile a numeric function, point the `accelerate` CLI to your Python entry file.
+Getting started is straightforward. To compile a numeric function, point the `accelerate` CLI to your Python entry file[cite: 2].
 
 ```bash
 # Example: Compiling a Fibonacci function
@@ -42,6 +42,8 @@ Aero-Accelerator requires a standard Rust and C toolchain.
 
 1. **System Requirements:**
 * Python 3.9+
+
+
 * Rust toolchain (get it at [rustup.rs](https://rustup.rs/)).
 
 
@@ -54,15 +56,29 @@ Aero-Accelerator requires a standard Rust and C toolchain.
 
 
 2. **Installation Commands:**
+
 ```bash
-git clone https://github.com/sys1own/aero-accelerator.git
+git clone [https://github.com/sys1own/aero-accelerator.git](https://github.com/sys1own/aero-accelerator.git)
 cd aero-accelerator
 # Install in editable mode
 pip install -e .
 
 ```
 
+---
 
+## Configuration (`accelerate.toml`)
+
+You can customize the compilation profile and precision handling by placing an `accelerate.toml` configuration file in your project root:
+
+```toml
+[build]
+output = "./libs"
+
+[precision_shield]
+default_float = "f64"  # Force default float precision scaling
+
+```
 
 ---
 
@@ -110,6 +126,8 @@ Aero-Accelerator follows a robust, multi-stage compilation pipeline to ensure bo
 | `--no-cache` | Force a full rebuild, ignoring the `.accelerate-cache/`.
 
  |
+| `--no-clean` | Preserve temporary generated Rust source crates for debugging. |
+| `--verbose` | Print detailed internal AST transformation and lowering logs. |
 
 ---
 
@@ -140,11 +158,23 @@ By default, functions use `i64`. The **Precision Shield** automatically promotes
 * **I/O Safety:** To ensure performance and safety, I/O operations (e.g., `print()`, `open()`, `requests.get()`) are not supported and will abort the build. Use `--fallback` if you need to maintain compatibility while keeping the original file structure.
 
 
-* **Boolean Logic:** Use `if/else` logic instead of direct `return` statements for boolean evaluations, as the generated Rust return type is strictly numeric (`i64`/`f64`).
+* **Boolean Logic Constraints:** The generated Rust return type must evaluate strictly to a numeric scalar value (`i64`/`f64`). Convert conditional statements directly into integer states instead of returning raw booleans:
 
+
+```python
+# Avoid this:
+def is_positive(x):
+    return x > 0
+
+# Do this:
+def check_positive(x):
+    if x > 0:
+        return 1
+    return 0
+
+```
 
 * **Scope:** User-defined function calls are currently restricted; stick to built-ins, `math.*`, and recursive calls.
-
 
 
 ---
@@ -167,3 +197,5 @@ Aero-Accelerator is designed for automated environments. Use the `--ci` flag to 
 ## License
 
 MIT – See the [LICENSE](https://www.google.com/search?q=LICENSE) file for details.
+
+---
