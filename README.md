@@ -1,533 +1,272 @@
-# Aero Accelerator
+# accelerator
 
-**Graph-based Python to Rust JIT compiler** – compile pure numeric Python functions into optimized native Rust extensions with a single command.
+**Graph-based Python to Rust JIT compiler.**
 
-[![Python](https://img.shields.io/badge/python-3.9+-blue.svg)](https://python.org)
-[![Rust](https://img.shields.io/badge/rust-1.70+-orange.svg)](https://rustup.rs)
-[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-passing-brightgreen.svg)](https://github.com/sys1own/aero-accelerator/actions)
-
----
-
-## Overview
-
-Aero Accelerator is a **production‑grade JIT compiler** that transforms pure numeric Python functions into compiled Rust extensions with zero boilerplate. It uses a graph‑rewriting pipeline (UAST → HIN → Precision Shield → Scaffold → Cargo) to generate idiomatic, optimized Rust code with PyO3 bindings.
-
-**Key benefits:**
-- **10–100× speedup** on CPU‑bound numeric workloads
-- **No manual Rust or FFI code** – just Python
-- **Sandboxed compilation** – all builds happen in isolated temporary directories
-- **Smart caching** – subsequent builds are nearly instant
-- **Fallback mode** – pure Python wrapper if compilation fails
-- **Multi‑function support** – compile entire modules at once
-
----
+`accelerate` takes pure numeric Python functions and compiles them into native
+Rust extension modules using PyO3. The generated `.so` (Linux), `.dylib` (macOS),
+or `.pyd` (Windows) is a drop-in replacement for the original Python module.
 
 ## Installation
 
-### Prerequisites
+Requirements:
 
-| Dependency | Version | Installation |
-|------------|---------|--------------|
-| Python | 3.9+ | [python.org](https://python.org) |
-| Rust toolchain | 1.70+ | [rustup.rs](https://rustup.rs) |
-| `m4` macro processor | latest | `sudo apt-get install m4` (Debian/Ubuntu), `brew install m4` (macOS) |
-| `libgmp-dev` | latest | `sudo apt-get install libgmp-dev` (Debian/Ubuntu) |
-
-### Install from PyPI (coming soon)
-
-```bash
-pip install aero-accelerator
-```
-
-### Install from source
+- Python 3.9+
+- A Rust toolchain (`rustc` and `cargo`) from <https://rustup.rs/>
+- `m4` (the `rug` crate needs it to build GMP/MPFR):  
+  `sudo apt-get install m4` on Debian/Ubuntu
+- A C toolchain (`gcc` or `clang`) for linking
 
 ```bash
 git clone https://github.com/sys1own/aero-accelerator.git
 cd aero-accelerator
 pip install -e .
+# or, with development/test tools:
+pip install -e '.[dev]'
 ```
 
-### Verify installation
+The `accelerate` command should now be available.
+
+## Quick start
 
 ```bash
-accelerate --help
-```
-
----
-
-## Quick Start
-
-```bash
-# 1. Create a Python file with a slow numeric function
-cat > fib.py <<'EOF'
+cat > slow.py <<'PY'
 def fib(n):
     if n <= 1:
         return n
     return fib(n - 1) + fib(n - 2)
-EOF
+PY
 
-# 2. Compile it to a native extension
-accelerate build --entry fib.py --function fib --output ./libs
-
-# 3. Use it in Python
-python -c "
+accelerate build --entry slow.py --function fib --output ./libs
+python - <<'PY'
 import sys
 sys.path.insert(0, './libs')
-import fib
-print(fib.fib(35))  # 9227465, computed almost instantly
-"
+import slow
+print(slow.fib(35))
+PY
 ```
 
-**Expected output:**
-```
-✅ Build succeeded! Compiled fib -> ./libs/fib.cpython-39-x86_64-linux-gnu.so
-📊 Performance:
-   Python: 2.34s
-   Rust:   0.05s
-   Speedup: 46.8x
-```
+This produces `./libs/slow.cpython-<platform>-<arch>.so`.
 
----
-
-## Architecture
-
-The compilation pipeline transforms Python source into native machine code through several stages:
+## CLI reference
 
 ```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ 1. Python Source (fib.py)                                                   │
-│    def fib(n):                                                              │
-│        if n <= 1: return n                                                  │
-│        return fib(n-1) + fib(n-2)                                           │
-└──────────────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ 2. UAST (Universal Abstract Syntax Tree)                                   │
-│    Language-agnostic, linearized representation.                           │
-│    Nodes: FunctionDef, If, Return, BinOp, Call, Name, Constant             │
-└──────────────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ 3. HIN (Hierarchical Interaction Net)                                     │
-│    Graph of typed nodes connected by ports.                               │
-│    * `Int` / `Float` nodes for literals                                   │
-│    * `Add`, `Sub`, `Mul`, `Div` for arithmetic                            │
-│    * `If` node with condition and branch edges                            │
-│    * `Call` node with function reference                                  │
-│    * `Return` node for function output                                    │
-└──────────────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ 4. Precision Shield                                                       │
-│    Scans the graph for numeric types and operations.                      │
-│    Injects high-performance traits:                                       │
-│    * `AeroNegMutExt` – zero-allocation negative mutation                  │
-│    * `AeroNthRootExt` – nth-root operations                              │
-│    * Optional `rug::Float` for arbitrary precision                       │
-└──────────────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ 5. Scaffold Engine                                                        │
-│    Generates a complete Rust crate:                                       │
-│    ```                                                                    │
-│    Cargo.toml                                                             │
-│      [package] name = "fib"                                               │
-│      [dependencies] pyo3 = "0.20", rug = "1.24"                          │
-│    src/lib.rs                                                             │
-│      #[pyfunction] fn fib(n: i64) -> i64 { ... }                         │
-│      #[pymodule(name = "fib")]                                           │
-│      fn py_module(_py: Python, m: &PyModule) -> PyResult<()> { ... }    │
-│    ```                                                                    │
-└──────────────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ 6. Sandboxed Build                                                       │
-│    * Temporary directory: `/tmp/accelerator-crate-XXXX/`                  │
-│    * `cargo fmt` – formats generated code                                │
-│    * `cargo build --release` – compiles to shared library                │
-│    * Cache stored in `.accelerate-cache/` (keyed by source hash)         │
-└──────────────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ 7. Artifact Delivery                                                     │
-│    * Shared library copied to `--output` directory                       │
-│    * Benchmark runs (Rust vs Python)                                     │
-│    * Temp directory cleaned (unless `--no-clean`)                       │
-└──────────────────────────────────────────────────────────────────────────────┘
+accelerate build --entry FILE (--function NAME | --functions A,B,C) [options]
 ```
 
----
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--entry` | required | Path to the Python source file |
+| `--function` | none | Single function to compile |
+| `--functions` | none | Comma-separated list of functions compiled into one module |
+| `--output` | `./libs` or `build.output` from config | Output directory for the compiled extension |
+| `--fallback` | false | On failure, write a pure-Python wrapper module instead |
+| `--no-cache` | false | Force a full rebuild instead of reusing `.accelerate-cache/` |
+| `--no-clean` | false | Keep the temporary Rust crate in `/tmp/accelerator-crate-*` for debugging |
+| `--no-benchmark` | false | Skip the Rust-vs-Python benchmark after a successful build |
+| `--benchmark-args` | none | Python literal passed to the benchmark function (e.g. `35` or `(10, 2.5)`). If omitted, a sensible default is used based on the argument count. |
+| `--verbose` | false | Print full `cargo` output |
+| `--ci` | false | Suppress non-essential output and exit with a clean status code |
+| `--target` | none | Cargo target triple for cross-compilation (e.g. `x86_64-unknown-linux-gnu`) |
+| `--config` | none | Explicit path to an `accelerate.toml` config file |
 
-## CLI Reference
+At least one of `--function` or `--functions` must be provided.
 
-### `build` – compile a Python function to a Rust extension
+## Configuration
 
-```bash
-accelerate build --entry FILE --function NAME [OPTIONS]
-```
+`accelerate` searches the current working directory and its parents for a file
+named `accelerate.toml`. The file uses a simple `key = value` syntax. Lines
+starting with `#` are comments. Lists use JSON syntax (`[1, 2, 3]`). Booleans
+can be `true`/`false`/`yes`/`no`/`on`/`off`. Strings should be quoted.
 
-#### Required arguments
-
-| Option | Description |
-|--------|-------------|
-| `--entry` | Path to the Python source file |
-| `--function` | Name of a single function to compile (use with `--functions` or alone) |
-| `--functions` | Comma-separated list of functions to compile into one module |
-
-#### Optional arguments
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `--output` | Output directory for the shared library | `./libs` or `[build].output` from config |
-| `--fallback` | On failure, generate a pure‑Python wrapper module | `false` |
-| `--no-cache` | Force a rebuild; ignore `.accelerate-cache/` | `false` |
-| `--no-clean` | Keep the temporary Rust crate for debugging | `false` |
-| `--no-benchmark` | Skip the Rust vs Python speed comparison | `false` |
-| `--benchmark-args` | Arguments for the benchmark (e.g., `35` or `(10, 2.5)`) | `None` |
-| `--verbose` | Print full `cargo` output | `false` |
-| `--ci` | Suppress non‑essential output for CI/CD | `false` |
-| `--target` | Cargo target triple (e.g., `aarch64-apple-darwin`) | host triple |
-| `--config` | Path to an `accelerate.toml` config file | auto‑discover |
-| `-h, --help` | Show help message | — |
-
-#### Examples
-
-```bash
-# Single function
-accelerate build --entry math_utils.py --function fib --output ./libs
-
-# Multiple functions
-accelerate build --entry math_utils.py --functions fib,factorial,sqrt --output ./libs
-
-# With fallback and verbose output
-accelerate build --entry risky.py --function unsafe --fallback --verbose
-
-# Cross‑compile for ARM64
-accelerate build --entry fib.py --function fib --target aarch64-apple-darwin
-```
-
----
-
-## Configuration (`accelerate.toml`)
-
-Project-level configuration file. The tool looks for `accelerate.toml` in the current directory and its parents.
-
-### Full example
+Recognized sections and keys:
 
 ```toml
 [build]
-output = "./libs"          # Default output directory
-cache = true               # Enable caching
-verbose = false            # Suppress cargo output by default
-clean = true               # Clean temp directories after build
+output = "./libs"     # default output directory
+cache = true          # enable .accelerate-cache/ (default true)
+verbose = false       # show full cargo output (same as --verbose)
 
 [precision_shield]
-enable_rug = true          # Enable arbitrary precision via rug
-default_float = "double"   # double, quad, arbitrary
+enable_rug = true     # import rug traits (default true when config is absent)
+default_float = ""    # set to "f64" or "double" to force f64 mode
 
 [benchmark]
-enabled = true             # Run benchmark after build
-args = "35"                # Default arguments for benchmark
-
-[fallback]
-enabled = true             # Generate Python wrapper on failure
-
-[ci]
-mode = "production"        # production, test, dev
+args = "35"           # default arguments for the benchmark
 ```
 
-### Precedence order
+Command-line flags always override config values.
 
-1. **Command-line flags** (highest)
-2. **Environment variables** (`ACCELERATE_*`)
-3. **`accelerate.toml` config**
-4. **Built-in defaults** (lowest)
+## How it works
 
----
+1. **Parse** the entry file with the Python `ast` module.
+2. **Normalize** it into a small universal AST.
+3. **Build** an internal graph-based intermediate representation for analysis.
+4. **Analyze** the graph with the precision shield to choose `i64` or `f64`
+   types and optional `rug` traits.
+5. **Generate** a temporary Rust crate from a template, with one
+   `#[pyfunction(name = "<python_name>")]` per requested function and a
+   `#[pymodule]` initializer named after the file stem.
+6. **Format** the generated code with `cargo fmt`.
+7. **Build** the crate in release mode with `cargo build --release`.
+8. **Cache** the resulting shared library in `.accelerate-cache/` keyed by a
+   SHA-256 hash of the source, function names, target triple, and shield config.
+9. **Copy** the artifact to `--output` and run a Rust-vs-Python benchmark for
+   the first requested function.
 
-## Supported Python Features
+## Supported Python
 
-### ✅ Fully supported
+The transpiler accepts a focused subset of numeric Python.
 
-| Construct | Example | Notes |
-|-----------|---------|-------|
-| Arithmetic | `a + b`, `a * b`, `a / b`, `a // b`, `a % b`, `a ** b` | Integer and float |
-| Comparisons | `a < b`, `a > b`, `a <= b`, `a >= b`, `a == b`, `a != b` | |
-| Logical | `a and b`, `a or b`, `not a` | Short-circuit evaluated |
-| Conditionals | `if a < b: return a else: return b` | `elif` supported |
-| Loops | `while i < n: i += 1` | |
-| For loops | `for i in range(n): ...` | Only `range()` supported |
-| Recursion | `def fib(n): return fib(n-1) + fib(n-2)` | Self‑recursion only |
-| Return | `return expr` | Single or multiple |
-| Built-in functions | `abs()`, `round()`, `pow()`, `min()`, `max()` | |
-| Math functions | `math.sqrt()`, `math.sin()`, `math.cos()`, `math.tan()` | Requires `import math` |
-| Math functions | `math.exp()`, `math.log()`, `math.log10()` | |
-| Math functions | `math.ceil()`, `math.floor()`, `math.trunc()` | |
-| Local variables | `x = 5; y = x * 2` | Type-inferred |
+### Statements
 
-### ❌ Not supported (compilation aborts)
+- `def` with positional arguments
+- `return <expr>`
+- `if` / `elif` / `else`
+- `while` loops (condition must be a comparison or boolean of comparisons)
+- `for <name> in range(...)` with one or two arguments (no step argument)
+- Single-target assignments and tuple/list unpacking from a tuple/list literal
+- Augmented assignment (`+=`, `-=`, etc.)
+- `pass` and bare expressions are accepted and ignored
 
-| Construct | Reason | Error message |
-|-----------|--------|---------------|
-| I/O | `open()`, `requests.get()`, `with open(...)` | "Unsupported I/O operation detected. Aborting." |
-| Imports | `import pandas`, `from numpy import *` | "Import statements not supported" |
-| Comprehensions | `[x*x for x in range(10)]` | "List comprehension not supported" |
-| Generators | `def gen(): yield x` | "Generator functions not supported" |
-| Lambdas | `lambda x: x + 1` | "Lambda functions not supported" |
-| Classes | `class MyClass:` | "Classes not supported" |
-| Strings | `"hello" + "world"` | "String operations not supported" |
-| Function calls (external) | `helper(x)` (not defined in same file) | "Only recursive calls supported" |
+### Expressions
 
----
+- Integer and float literals; `True` and `False` literals
+- Variables and arithmetic: `+`, `-`, `*`, `/` (always promotes to `f64`),
+  `//` (floor division), `%`, `**`
+- Bitwise operators: `<<`, `>>`, `|`, `^`, `&`
+- Unary `+`, `-`, `~`
+- Comparisons: `==`, `!=`, `<`, `<=`, `>`, `>=`
+- `abs`, `round`, `pow`, `min`, `max`
+- `math.sqrt`, `math.sin`, `math.cos`, `math.tan`, `math.exp`, `math.log`,
+  `math.log10`, `math.ceil`, `math.floor`, `math.trunc` (requires
+  `import math` at module level)
+- Recursive calls to the function being compiled
+- Multi-function modules via `--functions a,b`
 
-## Performance Considerations
+### Type inference
 
-### What makes a function a good candidate?
+Functions use `i64` by default. The precision shield switches to `f64` when it
+sees a float literal, a `/` operator, or any of `pow`, `sqrt`, `sin`, `cos`,
+`tan`, `exp`, `log`, or `log10`. You can also force `f64` with
+`[precision_shield] default_float = "f64"`.
 
-- **CPU‑bound** – spends most time in arithmetic, not I/O
-- **Numeric** – uses integers, floats, and math operations
-- **Predictable** – no dynamic dispatch or string manipulation
-- **Recursive or iterative** – loops and recursion work well
-- **Pure** – no side effects, mutable state, or global variables
+## Limitations and known issues
 
-### Expected speedups
+- **Boolean logic in return values**: `return a > 0`, `return a > 0 and b > 0`,
+  and `return not (a > 0)` currently fail because the generator emits a Rust
+  `bool` expression in a function whose return type is `i64`/`f64`. Use an
+  `if`/`else` to return numeric values.
+- **Boolean logic on plain variables**: `and`, `or`, and `not` work when
+  applied to comparisons (e.g. `if a > 0 and b > 0:`), but not on plain numeric
+  variables (e.g. `if a:` or `if not a:`).
+- **`import` inside functions** is not supported. Put `import math` at module
+  level if you need it.
+- **`for` loops** must iterate over `range(...)` with one or two arguments.
+  `for i in [1, 2, 3]` or `range(0, 10, 2)` are not supported.
+- **`break` / `continue`**, list/dict/set literals (except as tuple-unpack
+  sources), subscripting, comprehensions, `lambda`, `yield`, `try`/`except`,
+  `with`, classes, and arbitrary function calls are not supported.
+- **I/O detection**: `open()`, `print()`, `input()`, `requests.get()`,
+  `socket.*`, `os.*`, `subprocess.*`, `sys.*`, and `with` statements abort the
+  build with:
 
-| Workload | Typical speedup | Best case |
-|----------|----------------|-----------|
-| Recursive Fibonacci | **20–50×** | 100×+ |
-| Mandelbrot set | **15–40×** | 80× |
-| Monte Carlo simulation | **30–60×** | 120×+ |
-| N‑body simulation | **25–50×** | 90× |
-| Neural network training loops | **10–30×** | 60× |
+  ```
+  Unsupported I/O operation detected. Aborting.
+  ```
 
-### Why Rust?
+- **Other user-defined functions** cannot be called from the compiled function;
+  only builtins, `math.*`, and recursive calls to the target function itself
+  are allowed.
+- **Return-without-expression** (`return`) is not supported for non-void
+  functions.
+- The `rug` traits are imported when `enable_rug = true`, but the current
+  codegen still uses fixed-width `i64`/`f64`. Arbitrary-precision math is not
+  yet generated.
 
-- **Zero-cost abstractions** – no runtime overhead
-- **LLVM optimizations** – aggressive inlining, vectorization, unrolling
-- **No GIL** – true parallelism possible
-- **Memory safety** – no segmentation faults or buffer overflows
-- **FFI efficiency** – PyO3 bindings are fast and safe
+## Error handling and debugging
 
----
+- Missing `cargo`/`rustc` is reported as a missing-toolchain error.
+- Missing `m4` is detected from Cargo output and reported with an install hint.
+- Name collisions are classified from `E0428` errors.
+- Generic Cargo failures print:
 
-## Error Handling & Debugging
+  ```
+  Rust compilation failed. Use --verbose to see the full compiler output.
+  ```
 
-### Common error messages
+- Unsupported constructs include the source file path and line number when
+  available.
+- `--verbose` shows the full `cargo` output, including warnings.
+- `--no-clean` leaves the temporary Rust crate behind so you can inspect
+  `src/lib.rs`.
 
-| Error | Cause | Solution |
-|-------|-------|----------|
-| `No function named 'foo' found` | Function not defined in file | Check spelling and scope |
-| `entry file not found: foo.py` | File doesn't exist | Provide absolute path |
-| `Unsupported I/O operation detected` | `open()` or `requests.get()` used | Remove I/O or use `--fallback` |
-| `cargo build failed` | Rust compilation error | Run with `--verbose` to see details |
-| `name collision in Rust code` | File name == function name | Fixed in v0.2.0 – now uses separate names |
+## Performance and caching
 
-### Debugging a failed build
+Repeated builds of the same source, function names, target triple, and shield
+config use `.accelerate-cache/` and finish almost instantly. Use `--no-cache` to
+force a rebuild. In `--ci` mode the cache is placed under `/tmp` to avoid
+polluting the workspace.
 
-```bash
-# 1. Run with verbose output
-accelerate build --entry fib.py --function fib --verbose
+After a successful build, `accelerate` runs the compiled function and the
+original Python function with the same arguments and prints a speedup. Use
+`--no-benchmark` to skip this.
 
-# 2. Keep the temporary crate
-accelerate build --entry fib.py --function fib --no-clean
+## Fallback mode
 
-# 3. Inspect the generated Rust code
-cat /tmp/accelerator-crate-*/src/lib.rs
+If a function cannot be compiled, `--fallback` writes
+`<output>/<module_name>.py`, a tiny wrapper that imports the original Python
+module and re-exports the requested functions. This lets you keep the same import
+path even when Rust code generation is not possible.
 
-# 4. Manually build the crate to see full errors
-cd /tmp/accelerator-crate-*
-cargo build --release
-```
+## CI/CD integration
 
-### Runtime errors in the compiled module
+Use `--ci` in automated environments to suppress progress and benchmark output.
+Cross-compilation can be requested with `--target <triple>`; the target must be
+installed in your Rust toolchain.
 
-If the compiled function panics or returns incorrect results:
-
-```bash
-# 1. Generate a pure‑Python fallback for comparison
-accelerate build --entry fib.py --function fib --fallback
-
-# 2. Compare Rust vs Python results
-python -c "
-import sys; sys.path.insert(0, './libs')
-import fib_rust, fib_fallback
-assert fib_rust.fib(35) == fib_fallback.fib(35)
-print('Match!')"
-```
-
----
-
-## CI/CD Integration
-
-### GitHub Actions example
+Example GitHub Actions job:
 
 ```yaml
-name: Build and Test
-on: [push, pull_request]
-
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-      - run: sudo apt-get install -y m4 libgmp-dev
-      - run: pip install aero-accelerator
-      - run: accelerate build --entry fib.py --function fib --ci
-      - run: python -c "import sys; sys.path.insert(0, './libs'); import fib; fib.fib(35)"
+- uses: actions/checkout@v4
+- uses: actions/setup-python@v5
+  with:
+    python-version: "3.11"
+- uses: dtolnay/rust-toolchain@stable
+- run: sudo apt-get update && sudo apt-get install -y m4
+- run: pip install -e '.[dev]'
+- run: pytest -q
 ```
-
-### Docker image
-
-```dockerfile
-FROM python:3.11-slim
-
-RUN apt-get update && apt-get install -y \
-    curl m4 libgmp-dev build-essential \
- && rm -rf /var/lib/apt/lists/*
-
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y -q
-ENV PATH="/root/.cargo/bin:${PATH}"
-
-RUN pip install aero-accelerator
-
-WORKDIR /app
-```
-
----
 
 ## Development
 
-### Setting up a development environment
-
 ```bash
-git clone https://github.com/sys1own/aero-accelerator.git
-cd aero-accelerator
-python -m venv venv
-source venv/bin/activate
-pip install -e .[dev]
+pip install -e '.[dev]'
+black --target-version py310 src tests
+pytest -q
 ```
 
-### Running tests
+The `accelerator` package also exposes public modules:
 
-```bash
-# Run all tests
-pytest
-
-# Run specific test
-pytest tests/test_name_collision.py
-
-# Run with coverage
-pytest --cov=accelerator tests/
+```python
+from accelerator import aero_frontend, translator, hin_vm, shield, engine
 ```
 
-### Code structure
+## FAQ
 
-```
-aero-accelerator/
-├── src/
-│   └── accelerator/
-│       ├── __init__.py       # Package exports
-│       ├── cli.py            # Command-line interface
-│       ├── aero_frontend.py  # UAST generation (Python AST → UAST)
-│       ├── translator.py     # UAST → HIN translation
-│       ├── hin_vm.py         # HIN graph representation
-│       ├── shield.py         # Precision Shield (type detection, trait injection)
-│       ├── errors.py         # Error classification and messaging
-│       └── scaffold/
-│           └── engine.py     # Rust crate generator
-├── tests/
-│   ├── test_basic.py
-│   ├── test_name_collision.py
-│   ├── test_multi_function.py
-│   ├── test_fallback.py
-│   ├── test_cache.py
-│   └── test_config.py
-├── pyproject.toml
-├── accelerate.toml
-└── README.md
-```
+**Can the file name and function name be the same?**  
+Yes. The generated `#[pymodule]` initializer uses the file stem, while the
+underlying Rust function is prefixed with `_accel_` to avoid the collision.
 
-### Contributing
+**Can I compile more than one function at once?**  
+Yes: `accelerate build --entry file.py --functions f,g --output ./libs`.
 
-1. **Fork** the repository
-2. **Create** a feature branch: `git checkout -b feature/awesome`
-3. **Commit** your changes: `git commit -m 'Add awesome feature'`
-4. **Push** to the branch: `git push origin feature/awesome`
-5. **Open** a Pull Request
+**What if my function does I/O?**  
+The build aborts with `Unsupported I/O operation detected. Aborting.`. Use
+`--fallback` to generate a pure-Python wrapper instead.
 
-Please ensure:
-- All tests pass (`pytest`)
-- Code is formatted (`black` for Python, `rustfmt` for Rust templates)
-- Documentation is updated
-- New features include tests
-
----
-
-## Frequently Asked Questions
-
-### Q: Why is my compiled function slower than Python?
-
-**A:** Make sure the function is:
-- **CPU‑bound** (not I/O or memory‑bound)
-- **Using numeric types** (integers, floats)
-- **Not calling external libraries** (numpy, pandas)
-- **Using loops or recursion** (overhead is amortized)
-
-### Q: Can I compile functions that use `numpy`?
-
-**A:** No – `numpy` operations are C‑optimized. Aero Accelerator is for pure Python numeric code.
-
-### Q: Why do I need Rust installed?
-
-**A:** The tool doesn't provide a pre‑compiled binary; it generates Rust source and compiles it on your machine for maximum optimization.
-
-### Q: Does it work on Windows?
-
-**A:** Yes, but you need:
-- **Rust** – install via `rustup`
-- **Visual Studio C++ Build Tools** (for linking)
-- **m4** – via `choco install m4` or similar
-
-### Q: What about pyproject.toml support?
-
-**A:** Planned for v0.3.0. You'll be able to define accelerators in your `pyproject.toml`.
-
-### Q: Can I customize the generated Rust code?
-
-**A:** Not directly, but you can:
-- Use `--no-clean` to inspect and modify the temp crate
-- Add a template directory (future feature)
-
-### Q: Is there a limit on function size?
-
-**A:** No hard limit, but very large functions (>10,000 nodes) may take longer to compile. Use the `--verbose` flag to monitor progress.
-
----
+**Does `accelerate.toml` support nested tables?**  
+No. It is a simple `key = value` parser with section headers.
 
 ## License
 
-This project is licensed under the **MIT License** – see the [LICENSE](LICENSE) file for details.
-
----
-
-## Acknowledgements
-
-- Built on the foundations of **Geometry of Interaction** and **Interaction Nets** research
-- Uses **PyO3** for Rust/Python bindings
-- Uses **rug** for arbitrary‑precision arithmetic
-- Inspired by the Aero Topos project
-
----
+MIT – see [LICENSE](LICENSE).
