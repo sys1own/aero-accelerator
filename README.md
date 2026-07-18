@@ -1,14 +1,14 @@
 # Aero-Accelerator
 
-**Aero-Accelerator** is a high-performance, graph-based JIT compiler designed to bridge the gap between Python and Rust[cite: 2]. It transpiles numeric Python functions into native Rust extension modules, giving your code a significant speed boost while maintaining the familiar Python interface[cite: 2].
+**Aero-Accelerator** is a high-performance, graph-based JIT compiler designed to bridge the gap between Python and Rust. It transpiles numeric Python functions into native Rust extension modules, giving your code a significant speed boost while maintaining the familiar Python interface.
 
-The generated artifacts (`.so`, `.dylib`, or `.pyd`) act as drop-in replacements for your original modules, allowing for seamless integration into existing pipelines[cite: 2].
+The generated artifacts (`.so`, `.dylib`, or `.pyd`) act as drop-in replacements for your original modules, allowing for seamless integration into existing pipelines.
 
 ---
 
 ## Quick Start
 
-Getting started is straightforward. To compile a numeric function, point the `accelerate` CLI to your Python entry file[cite: 2].
+Getting started is straightforward. To compile a numeric function, point the `accelerate` CLI to your Python entry file.
 
 ```bash
 # Example: Compiling a Fibonacci function
