@@ -1,4 +1,3 @@
-```markdown
 # Aero Accelerator
 
 **Graph-based Python to Rust JIT compiler** – compile pure numeric Python functions into optimized native Rust extensions with a single command.
@@ -532,6 +531,3 @@ This project is licensed under the **MIT License** – see the [LICENSE](LICENSE
 - Inspired by the Aero Topos project
 
 ---
-
-*Built with ❤️ for Python developers who need speed without complexity.*
-```
