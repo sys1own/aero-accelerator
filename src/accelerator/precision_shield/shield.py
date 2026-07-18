@@ -3,7 +3,31 @@
 from __future__ import annotations
 
 import ast
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
+
+from ..errors import UnsupportedError
+
+_FLOAT_MATH_FUNCS: Set[str] = {
+    "sqrt",
+    "sin",
+    "cos",
+    "tan",
+    "exp",
+    "log",
+    "log10",
+    "pow",
+    "ceil",
+    "floor",
+    "trunc",
+}
+_BITWISE_OPS: Set[type] = {
+    ast.LShift,
+    ast.RShift,
+    ast.BitOr,
+    ast.BitXor,
+    ast.BitAnd,
+    ast.Invert,
+}
 
 
 class Shield:
@@ -51,6 +75,12 @@ class Shield:
         ):
             function_type = "f64"
 
+        if function_type == "f64" and _uses_bitwise(func):
+            raise UnsupportedError(
+                "Bitwise operations are only supported on integer-typed values",
+                node=func,
+            )
+
         uses_float = function_type == "f64"
         recursive = _is_recursive(func)
 
@@ -97,18 +127,15 @@ def _infer_number_type(func: ast.FunctionDef) -> str:
             ):
                 return "f64"
         if isinstance(node, ast.Call):
-            func_name = _call_name(node)
-            if func_name in {
-                "sqrt",
-                "sin",
-                "cos",
-                "tan",
-                "exp",
-                "log",
-                "log10",
-                "pow",
-            }:
-                return "f64"
+            if isinstance(node.func, ast.Attribute):
+                base = node.func.value
+                attr = node.func.attr
+                if (
+                    isinstance(base, ast.Name)
+                    and base.id == "math"
+                    and attr in _FLOAT_MATH_FUNCS
+                ):
+                    return "f64"
     return "i64"
 
 
@@ -118,6 +145,16 @@ def _is_recursive(func: ast.FunctionDef) -> bool:
         if isinstance(node, ast.Call):
             if _call_name(node) == name:
                 return True
+    return False
+
+
+def _uses_bitwise(func: ast.FunctionDef) -> bool:
+    """Return True if the function uses any bitwise operators or inversion."""
+    for node in ast.walk(func):
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Invert):
+            return True
+        if isinstance(node, ast.BinOp) and type(node.op) in _BITWISE_OPS:
+            return True
     return False
 
 

@@ -155,6 +155,14 @@ class RustGenerator:
             return count > 0
         return count > 1
 
+    @staticmethod
+    def _rhs_uses_only(expr: ast.expr, allowed: set[str]) -> bool:
+        """Return True if ``expr`` references no names outside ``allowed``."""
+        for node in ast.walk(expr):
+            if isinstance(node, ast.Name) and node.id not in allowed:
+                return False
+        return True
+
     def _count_targets_in_body(
         self, name: str, stmts: List[ast.stmt], in_loop: bool
     ) -> int:
@@ -184,46 +192,75 @@ class RustGenerator:
     def _initializers_and_body(self) -> Tuple[List[str], List[ast.stmt]]:
         """Return `let` declarations and the remaining body statements.
 
-        Non-argument variables that are assigned a non-self-referential value
-        on their first top-level assignment are initialized directly, avoiding
-        a zeroed dummy declaration followed by an immediate overwrite. The
-        ``mut`` keyword is omitted when the variable is never assigned again.
+        Local variables are initialized with their first top-level assignment
+        when the right-hand side only references already-declared names. The
+        ``mut`` keyword is omitted when the variable is never assigned again. This
+        preserves source order and avoids dummy zero values that are immediately
+        overwritten.
         """
         defaults: List[str] = []
-        body = list(self.func.body)
+        body: List[ast.stmt] = []
+        declared = set(self.arg_names)
 
-        for name in sorted(self.assigned):
-            mutable = self._is_mutable(name)
-            mut = "mut " if mutable else ""
-
-            if name in self.arg_names:
-                defaults.append(f"let {mut}{name} = {name};")
-                continue
-
-            for i, stmt in enumerate(body):
+        for stmt in self.func.body:
+            if (
+                isinstance(stmt, ast.Assign)
+                and len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], ast.Name)
+            ):
+                name = stmt.targets[0].id
                 if (
-                    isinstance(stmt, ast.Assign)
-                    and len(stmt.targets) == 1
-                    and isinstance(stmt.targets[0], ast.Name)
-                    and stmt.targets[0].id == name
+                    name in self.assigned
+                    and name not in self.arg_names
                     and not self._name_in_expr(stmt.value, name)
+                    and self._rhs_uses_only(stmt.value, declared)
                 ):
+                    mutable = self._is_mutable(name)
+                    mut = "mut " if mutable else ""
                     value = self._strip_outer_parens(
                         self._emit_expr(stmt.value, self.function_type)
                     )
                     defaults.append(f"let {mut}{name} = {value};")
-                    body.pop(i)
-                    break
-            else:
-                # No top-level initializer; declare uninitialized. The first
-                # real assignment will initialize the variable, which avoids
-                # an "assigned value is never read" warning on a dummy zero.
-                defaults.append(f"let {mut}{name};")
+                    declared.add(name)
+                    continue
+            body.append(stmt)
 
+        # Reassigned arguments need a mutable shadow binding.
+        for name in self.arg_names:
+            if name in self.assigned:
+                defaults.append(f"let mut {name} = {name};")
+
+        # Any remaining assigned names are declared uninitialized; the body will
+        # initialize them on first use.
+        remaining = sorted(self.assigned - declared)
+        for name in remaining:
+            mutable = self._is_mutable(name)
+            mut = "mut " if mutable else ""
+            defaults.append(f"let {mut}{name};")
+
+        # Argument shadows should appear before local declarations.
         return defaults, body
 
     def _zero(self) -> str:
         return "0.0_f64" if self.function_type == "f64" else "0_i64"
+
+    def _return_type(self) -> str:
+        """Derive the Rust return type from the function's return statements."""
+        sizes: set[int] = set()
+        for node in ast.walk(self.func):
+            if isinstance(node, ast.Return) and node.value is not None:
+                if isinstance(node.value, (ast.Tuple, ast.List)):
+                    sizes.add(len(_elements(node.value)))
+                else:
+                    sizes.add(1)
+        if not sizes or sizes == {1}:
+            return self.function_type
+        if len(sizes) != 1:
+            raise UnsupportedError(
+                "All return statements must return the same tuple size",
+                node=self.func,
+            )
+        return f"({', '.join([self.function_type] * sizes.pop())})"
 
     def _next_tmp(self) -> str:
         self._tmp_counter += 1
@@ -255,9 +292,10 @@ class RustGenerator:
         args = ", ".join(
             f"{name}: {typ}" for name, typ in zip(self.arg_names, self.arg_types)
         )
+        return_type = self._return_type()
         header = (
             f'#[pyfunction(name = "{self.orig_name}")]\n'
-            f"fn {self.rust_function_name}({args}) -> {self.return_type} {{"
+            f"fn {self.rust_function_name}({args}) -> {return_type} {{"
         )
 
         defaults, body_stmts = self._initializers_and_body()
@@ -270,9 +308,12 @@ class RustGenerator:
         if isinstance(stmt, ast.Return):
             if stmt.value is None:
                 return "return;"
-            value = self._strip_outer_parens(
-                self._emit_expr(stmt.value, self.function_type)
-            )
+            if isinstance(stmt.value, (ast.Tuple, ast.List)):
+                value = self._emit_expr(stmt.value, self.function_type)
+            else:
+                value = self._strip_outer_parens(
+                    self._emit_expr(stmt.value, self.function_type)
+                )
             return f"return {value};"
         if isinstance(stmt, ast.Assign):
             return self._emit_assign(stmt)
@@ -475,10 +516,22 @@ class RustGenerator:
         raise UnsupportedError(f"Unsupported literal: {value!r}", node=expr)
 
     def _emit_unaryop(self, expr: ast.UnaryOp, ctx: str) -> str:
+        if isinstance(expr.op, ast.Invert):
+            if self.function_type != "i64":
+                raise UnsupportedError(
+                    "Bitwise inversion is only supported on integer-typed values",
+                    node=expr,
+                )
+            operand = self._emit_expr(expr.operand, "i64")
+            result = f"!({operand})"
+            if ctx == "bool":
+                return f"({result} != 0)"
+            return result
+
         operand = self._emit_expr(expr.operand, ctx)
         if isinstance(expr.op, ast.UAdd):
             return operand
-        if isinstance(expr.op, (ast.USub, ast.Invert)):
+        if isinstance(expr.op, ast.USub):
             return f"-({operand})"
         if isinstance(expr.op, ast.Not):
             return f"!({operand})"
@@ -511,16 +564,25 @@ class RustGenerator:
             if ctx == "f64":
                 return f"({left}).powf({right})"
             return f"({left}).pow(({right}) as u32)"
-        if isinstance(op, ast.LShift):
-            return f"({left} << {right})"
-        if isinstance(op, ast.RShift):
-            return f"({left} >> {right})"
-        if isinstance(op, ast.BitOr):
-            return f"({left} | {right})"
-        if isinstance(op, ast.BitXor):
-            return f"({left} ^ {right})"
-        if isinstance(op, ast.BitAnd):
-            return f"({left} & {right})"
+        if isinstance(op, (ast.LShift, ast.RShift, ast.BitOr, ast.BitXor, ast.BitAnd)):
+            if self.function_type != "i64":
+                raise UnsupportedError(
+                    "Bitwise operations are only supported on integer-typed values",
+                    node=expr,
+                )
+            left = self._emit_expr(expr.left, "i64")
+            right = self._emit_expr(expr.right, "i64")
+            op_str = {
+                ast.LShift: "<<",
+                ast.RShift: ">>",
+                ast.BitOr: "|",
+                ast.BitXor: "^",
+                ast.BitAnd: "&",
+            }[type(op)]
+            result = f"({left} {op_str} {right})"
+            if ctx == "bool":
+                return f"({result} != 0)"
+            return result
 
         raise UnsupportedError(
             f"Unsupported binary operator: {type(op).__name__}", node=expr
