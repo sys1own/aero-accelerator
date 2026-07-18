@@ -166,3 +166,36 @@ def test_no_rug_unused_import_warning(tmp_workspace: Path) -> None:
     assert result.returncode == 0, result.stdout
     assert "unused import: rug::Integer" not in result.stdout
     assert "rug" not in result.stdout
+
+
+def test_immutable_local_omits_mut(tmp_workspace: Path) -> None:
+    """A local variable assigned only once does not receive an unnecessary `mut`."""
+    entry = _write_source(
+        tmp_workspace,
+        "square.py",
+        "def square(x):\n" "    y = x * x\n" "    return y\n",
+    )
+    out = tmp_workspace / "libs"
+    result = _run(
+        [
+            "build",
+            "--entry",
+            str(entry),
+            "--function",
+            "square",
+            "--output",
+            str(out),
+            "--verbose",
+            "--no-benchmark",
+        ],
+        cwd=tmp_workspace,
+    )
+    assert result.returncode == 0, result.stdout
+    assert "does not need to be mutable" not in result.stdout
+    assert "warning" not in result.stdout.lower()
+
+    so = list(out.glob("square*.so"))
+    assert so, "Expected compiled extension"
+
+    imported = _import_module(so[0], "square")
+    assert imported.square(7) == 49
