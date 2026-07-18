@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import ast
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional
 
 
 class Shield:
@@ -34,31 +34,44 @@ class Shield:
         if func is None:
             # Fallback to graph-level hints if the AST is unavailable.
             return {
+                "function_name": func_name,
                 "arg_types": ["i64"],
                 "return_type": "i64",
                 "function_type": "i64",
                 "recursive": False,
-                "traits": ["Integer"],
+                "traits": self._traits(["Integer"]),
             }
 
         arg_names = [a.arg for a in func.args.args]
         function_type = _infer_number_type(func)
 
+        if (
+            self.config.get("default_float") in ("double", "f64")
+            and function_type == "i64"
+        ):
+            function_type = "f64"
+
         uses_float = function_type == "f64"
         recursive = _is_recursive(func)
 
-        traits: List[str] = ["Integer"]
+        traits = ["Integer"]
         if uses_float:
             traits.append("Float")
 
         return {
+            "function_name": func_name,
             "arg_types": [function_type] * len(arg_names),
             "return_type": function_type,
             "function_type": function_type,
             "arg_names": arg_names,
             "recursive": recursive,
-            "traits": traits,
+            "traits": self._traits(traits),
         }
+
+    def _traits(self, traits: List[str]) -> List[str]:
+        if self.config.get("enable_rug") is False:
+            return []
+        return traits
 
 
 def _find_function(tree: ast.AST, name: Optional[str]) -> Optional[ast.FunctionDef]:

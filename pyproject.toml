@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "accelerator"
-version = "0.1.0"
+version = "0.2.0"
 description = "Graph-based Python to Rust JIT compiler."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -20,6 +20,7 @@ accelerate = "accelerator.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+include = ["accelerator*"]
 
 [tool.setuptools.package-data]
 accelerator = ["templates/*"]

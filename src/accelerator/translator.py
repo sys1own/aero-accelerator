@@ -25,10 +25,7 @@ from .hin_vm import (
 
 def _kind(node: dict) -> str:
     return (
-        node.get("canonical_kind")
-        or node.get("kind")
-        or node.get("type")
-        or "unknown"
+        node.get("canonical_kind") or node.get("kind") or node.get("type") or "unknown"
     )
 
 
@@ -144,9 +141,7 @@ class UASTToHINTranslator:
         name = node.get("name")
         if name and self.scope_stack:
             self.scope_stack[-1][name] = ctor.p
-            self._ref_remaining[-1].setdefault(
-                name, self._count_name(node, name)
-            )
+            self._ref_remaining[-1].setdefault(name, self._count_name(node, name))
         return ctor.p
 
     def _build_binding(self, node: dict, net: HINNetwork) -> None:
@@ -297,7 +292,9 @@ class UASTToHINTranslator:
     @staticmethod
     def _children(node: dict) -> List[dict]:
         children = node.get("children") or node.get("body") or []
-        return [c for c in UASTToHINTranslator._as_list(children) if isinstance(c, dict)]
+        return [
+            c for c in UASTToHINTranslator._as_list(children) if isinstance(c, dict)
+        ]
 
     @staticmethod
     def _as_list(value) -> list:
@@ -357,10 +354,7 @@ class UASTToHINTranslator:
         adj = self._adjacency(net, node_list)
 
         fiedler = self.compute_fiedler_vector(adj)
-        side = {
-            node_list[i].node_id: (0 if fiedler[i] >= 0 else 1)
-            for i in range(n)
-        }
+        side = {node_list[i].node_id: (0 if fiedler[i] >= 0 else 1) for i in range(n)}
         if len({s for s in side.values()}) == 1:
             median = float(np.median(fiedler))
             side = {
