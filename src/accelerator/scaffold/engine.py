@@ -7,15 +7,20 @@ import re
 import tempfile
 from importlib import resources
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 
 class UnsupportedError(ValueError):
     """Raised when the source contains constructs we cannot compile."""
 
+    def __init__(self, message: str, node: Optional[ast.AST] = None) -> None:
+        super().__init__(message)
+        self.node = node
+        self.message = message
+
 
 class Engine:
-    """Write a Rust source crate for the function described by ``annotated_graph``."""
+    """Write a Rust source crate for the functions described by ``annotated_graph``."""
 
     def generate(
         self,
@@ -23,27 +28,63 @@ class Engine:
         output_dir: Path,
         *,
         module_name: str,
-        function_name: str,
+        function_names: List[str],
         source: str,
     ) -> Path:
         """Create a temporary crate, write Cargo.toml and src/lib.rs, and return its path."""
-        traits = getattr(annotated_graph, "traits", {})
+        traits_by_name = self._traits(annotated_graph)
         crate_root = Path(tempfile.mkdtemp(prefix="accelerator-crate-"))
         src_dir = crate_root / "src"
         src_dir.mkdir(parents=True)
 
         tree = ast.parse(source)
-        func = _find_function(tree, function_name)
-        if func is None:
-            raise UnsupportedError(f"Function {function_name!r} not found in source")
+        function_blocks: List[str] = []
+        module_init_lines: List[str] = []
+        all_traits: Set[str] = set()
 
-        generator = RustGenerator(func, module_name, traits)
-        cargo_toml, lib_rs = generator.emit()
+        for name in function_names:
+            func = _find_function(tree, name)
+            if func is None:
+                raise UnsupportedError(f"Function {name!r} not found in source")
+            traits = traits_by_name.get(name, {}) or {}
+            generator = RustGenerator(func, module_name, traits)
+            block = generator.emit()
+            function_blocks.append(block)
+            module_init_lines.append(
+                f"    m.add_wrapped(wrap_pyfunction!({generator.rust_function_name}))?;"
+            )
+            all_traits.update(generator.shield_traits())
 
-        (crate_root / "Cargo.toml").write_text(cargo_toml, encoding="utf-8")
-        (src_dir / "lib.rs").write_text(lib_rs, encoding="utf-8")
+        cargo_template = (
+            resources.files("accelerator.templates").joinpath("Cargo.toml").read_text()
+        )
+        lib_template = (
+            resources.files("accelerator.templates").joinpath("lib.rs").read_text()
+        )
+
+        crate_name = _rust_identifier(module_name)
+        cargo = cargo_template.format(crate_name=crate_name)
+        lib = lib_template.format(
+            shield_imports=_shield_imports(all_traits),
+            functions="\n\n".join(function_blocks),
+            module_init="\n".join(module_init_lines),
+            module_name=crate_name,
+        )
+
+        (crate_root / "Cargo.toml").write_text(cargo, encoding="utf-8")
+        (src_dir / "lib.rs").write_text(lib, encoding="utf-8")
 
         return crate_root
+
+    @staticmethod
+    def _traits(annotated_graph: Any) -> Dict[str, Any]:
+        by_name = getattr(annotated_graph, "traits_by_name", None)
+        if by_name is not None:
+            return by_name
+        single = getattr(annotated_graph, "traits", None)
+        if isinstance(single, dict):
+            return {single.get("function_name", ""): single}
+        return {}
 
 
 class RustGenerator:
@@ -93,6 +134,9 @@ class RustGenerator:
         traits: Dict[str, Any],
     ):
         self.func = func
+        self.orig_name = func.name
+        self.safe_name = _rust_identifier(func.name)
+        self.rust_function_name = f"_accel_{self.safe_name}"
         self.module_name = _rust_identifier(module_name)
         self.crate_name = self.module_name
         self.traits = traits
@@ -109,25 +153,11 @@ class RustGenerator:
         self.assigned = self._collect_assigned()
         self._tmp_counter = 0
 
-    def emit(self) -> tuple[str, str]:
-        function_code = self._emit_function()
-        cargo_template = resources.files("accelerator.templates").joinpath("Cargo.toml").read_text()
-        lib_template = resources.files("accelerator.templates").joinpath("lib.rs").read_text()
+    def shield_traits(self) -> Set[str]:
+        return set(self.traits.get("traits", ["Integer"]))
 
-        shield_traits = self.traits.get("traits", ["Integer"])
-        shield_imports = "\n".join(
-            ["#[allow(unused_imports)]"]
-            + [f"use rug::{t};" for t in shield_traits]
-        )
-
-        cargo = cargo_template.format(crate_name=self.crate_name)
-        lib = lib_template.format(
-            shield_imports=shield_imports,
-            function_code=function_code,
-            module_name=self.module_name,
-            function_name=self.func.name,
-        )
-        return cargo, lib
+    def emit(self) -> str:
+        return self._emit_function()
 
     # ------------------------------------------------------------------
     # Collection helpers
@@ -172,10 +202,13 @@ class RustGenerator:
     # Statement emission
     # ------------------------------------------------------------------
     def _emit_function(self) -> str:
-        args = f", ".join(
+        args = ", ".join(
             f"{name}: {typ}" for name, typ in zip(self.arg_names, self.arg_types)
         )
-        header = f"#[pyfunction]\nfn {self.func.name}({args}) -> {self.return_type} {{"
+        header = (
+            f'#[pyfunction(name = "{self.orig_name}")]\n'
+            f"fn {self.rust_function_name}({args}) -> {self.return_type} {{"
+        )
 
         defaults: List[str] = []
         for name in sorted(self.assigned):
@@ -212,7 +245,9 @@ class RustGenerator:
         if isinstance(stmt, ast.Expr):
             # Stand-alone expressions are not meaningful for numeric math.
             return ""
-        raise UnsupportedError(f"Unsupported statement: {type(stmt).__name__}")
+        raise UnsupportedError(
+            f"Unsupported statement: {type(stmt).__name__}", node=stmt
+        )
 
     def _emit_assign(self, stmt: ast.Assign) -> str:
         if len(stmt.targets) == 1:
@@ -223,18 +258,23 @@ class RustGenerator:
             if isinstance(target, (ast.Tuple, ast.List)):
                 return self._emit_tuple_unpack(target, stmt.value)
 
-        raise UnsupportedError("Only single-target or tuple unpacking assignments are supported")
+        raise UnsupportedError(
+            "Only single-target or tuple unpacking assignments are supported",
+            node=stmt,
+        )
 
     def _emit_tuple_unpack(self, target: ast.AST, value: ast.expr) -> str:
         names = _names_in_target(target)
         if len(names) != len(_elements(target)):
-            raise UnsupportedError("Only plain names may appear in a tuple unpack")
+            raise UnsupportedError(
+                "Only plain names may appear in a tuple unpack", node=target
+            )
         if not isinstance(value, (ast.Tuple, ast.List)):
-            raise UnsupportedError("Tuple unpack requires a tuple/list on the right")
+            raise UnsupportedError(
+                "Tuple unpack requires a tuple/list on the right", node=value
+            )
 
-        elements = [
-            self._emit_expr(e, self.function_type) for e in _elements(value)
-        ]
+        elements = [self._emit_expr(e, self.function_type) for e in _elements(value)]
         tmp = self._next_tmp()
         lines = [f"let {tmp} = ({', '.join(elements)});"]
         for i, name in enumerate(names):
@@ -243,7 +283,10 @@ class RustGenerator:
 
     def _emit_augassign(self, stmt: ast.AugAssign) -> str:
         if not isinstance(stmt.target, ast.Name):
-            raise UnsupportedError("Only simple names may be used in augmented assignment")
+            raise UnsupportedError(
+                "Only simple names may be used in augmented assignment",
+                node=stmt,
+            )
         name = stmt.target.id
         fake = ast.BinOp(
             left=ast.Name(id=name, ctx=ast.Load()),
@@ -278,12 +321,14 @@ class RustGenerator:
 
     def _emit_for(self, stmt: ast.For) -> str:
         if not isinstance(stmt.target, ast.Name):
-            raise UnsupportedError("Only a single loop variable is supported")
+            raise UnsupportedError(
+                "Only a single loop variable is supported", node=stmt
+            )
         if not isinstance(stmt.iter, ast.Call):
-            raise UnsupportedError("Only range(...) loops are supported")
+            raise UnsupportedError("Only range(...) loops are supported", node=stmt)
         call = stmt.iter
         if _call_name(call) != "range":
-            raise UnsupportedError("Only range(...) loops are supported")
+            raise UnsupportedError("Only range(...) loops are supported", node=call)
         if len(call.args) == 1:
             stop = self._emit_expr(call.args[0], self.function_type)
             range_expr = f"0..{stop}"
@@ -292,7 +337,7 @@ class RustGenerator:
             stop = self._emit_expr(call.args[1], self.function_type)
             range_expr = f"{start}..{stop}"
         else:
-            raise UnsupportedError("range(...) with step is not supported")
+            raise UnsupportedError("range(...) with step is not supported", node=call)
         body = self._emit_body(stmt.body)
         return f"for {stmt.target.id} in {range_expr} {{\n{body}\n}}"
 
@@ -324,8 +369,10 @@ class RustGenerator:
         if isinstance(expr, (ast.Tuple, ast.List)):
             return f"({', '.join(self._emit_expr(e, ctx) for e in expr.elts)})"
         if isinstance(expr, ast.Subscript):
-            raise UnsupportedError("Subscript/indexing is not supported")
-        raise UnsupportedError(f"Unsupported expression: {type(expr).__name__}")
+            raise UnsupportedError("Subscript/indexing is not supported", node=expr)
+        raise UnsupportedError(
+            f"Unsupported expression: {type(expr).__name__}", node=expr
+        )
 
     def _emit_constant(self, expr: ast.Constant, ctx: str) -> str:
         value = expr.value
@@ -337,11 +384,13 @@ class RustGenerator:
                     return f"{value}_f64"
                 return f"{value}_f64"
             if isinstance(value, float):
-                raise UnsupportedError("Float literal in an integer-typed function")
+                raise UnsupportedError(
+                    "Float literal in an integer-typed function", node=expr
+                )
             return f"{value}_i64"
         if value is None:
-            raise UnsupportedError("None is not a numeric value")
-        raise UnsupportedError(f"Unsupported literal: {value!r}")
+            raise UnsupportedError("None is not a numeric value", node=expr)
+        raise UnsupportedError(f"Unsupported literal: {value!r}", node=expr)
 
     def _emit_unaryop(self, expr: ast.UnaryOp, ctx: str) -> str:
         operand = self._emit_expr(expr.operand, ctx)
@@ -351,7 +400,9 @@ class RustGenerator:
             return f"-({operand})"
         if isinstance(expr.op, ast.Not):
             return f"!({operand})"
-        raise UnsupportedError(f"Unsupported unary operator: {type(expr.op).__name__}")
+        raise UnsupportedError(
+            f"Unsupported unary operator: {type(expr.op).__name__}", node=expr
+        )
 
     def _emit_binop(self, expr: ast.BinOp, ctx: str) -> str:
         left = self._emit_expr(expr.left, ctx)
@@ -389,11 +440,15 @@ class RustGenerator:
         if isinstance(op, ast.BitAnd):
             return f"({left} & {right})"
 
-        raise UnsupportedError(f"Unsupported binary operator: {type(op).__name__}")
+        raise UnsupportedError(
+            f"Unsupported binary operator: {type(op).__name__}", node=expr
+        )
 
     def _emit_compare(self, expr: ast.Compare, ctx: str) -> str:
         if len(expr.ops) != 1 or len(expr.comparators) != 1:
-            raise UnsupportedError("Only simple binary comparisons are supported")
+            raise UnsupportedError(
+                "Only simple binary comparisons are supported", node=expr
+            )
         left = self._emit_expr(expr.left, ctx)
         right = self._emit_expr(expr.comparators[0], ctx)
         op = expr.ops[0]
@@ -406,7 +461,9 @@ class RustGenerator:
             ast.GtE: ">=",
         }.get(type(op))
         if op_str is None:
-            raise UnsupportedError(f"Unsupported comparison: {type(op).__name__}")
+            raise UnsupportedError(
+                f"Unsupported comparison: {type(op).__name__}", node=expr
+            )
         return f"({left} {op_str} {right})"
 
     def _emit_boolop(self, expr: ast.BoolOp, ctx: str) -> str:
@@ -431,13 +488,16 @@ class RustGenerator:
         if base is None and name == self.func.name:
             if len(args) != len(self.arg_names):
                 raise UnsupportedError(
-                    f"Recursive call to {name} has wrong number of arguments"
+                    f"Recursive call to {name} has wrong number of arguments",
+                    node=expr,
                 )
-            return f"{name}({', '.join(args)})"
+            return f"{self.rust_function_name}({', '.join(args)})"
 
         if base is None and name in {"abs", "round"}:
             if len(args) != 1:
-                raise UnsupportedError(f"{name}() takes exactly one argument")
+                raise UnsupportedError(
+                    f"{name}() takes exactly one argument", node=expr
+                )
             arg = args[0]
             if name == "abs":
                 return f"({arg}).abs()"
@@ -447,7 +507,7 @@ class RustGenerator:
 
         if base is None and name == "pow":
             if len(args) != 2:
-                raise UnsupportedError("pow() takes exactly two arguments")
+                raise UnsupportedError("pow() takes exactly two arguments", node=expr)
             left, right = args
             if ctx == "f64":
                 return f"({left}).powf({right})"
@@ -455,7 +515,9 @@ class RustGenerator:
 
         if base is None and name in {"min", "max"}:
             if not args:
-                raise UnsupportedError(f"{name}() requires at least one argument")
+                raise UnsupportedError(
+                    f"{name}() requires at least one argument", node=expr
+                )
             method = "min" if name == "min" else "max"
             result = f"({args[0]})"
             for a in args[1:]:
@@ -466,8 +528,8 @@ class RustGenerator:
             return self._emit_math_call(name, args, ctx)
 
         if base in self.IO_MODULES or name in self.IO_NAMES:
-            raise UnsupportedError("io")
-        raise UnsupportedError(f"Unsupported call: {name}")
+            raise UnsupportedError("io", node=expr)
+        raise UnsupportedError(f"Unsupported call: {name}", node=expr)
 
     def _emit_math_call(self, name: str, args: List[str], ctx: str) -> str:
         if name == "pow":
@@ -539,13 +601,66 @@ def _call_base(expr: ast.Call) -> Optional[str]:
     return None
 
 
+def _shield_imports(traits: Set[str]) -> str:
+    if not traits:
+        return ""
+    lines = ["#[allow(unused_imports)]"]
+    for t in sorted(traits):
+        lines.append(f"use rug::{t};")
+    return "\n".join(lines)
+
+
 _RUST_KEYWORDS = {
-    "as", "break", "const", "continue", "crate", "else", "enum", "extern",
-    "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod",
-    "move", "mut", "pub", "ref", "return", "self", "Self", "static", "struct",
-    "super", "trait", "true", "type", "unsafe", "use", "where", "while",
-    "dyn", "async", "await", "abstract", "become", "box", "do", "final",
-    "macro", "override", "priv", "typeof", "unsized", "virtual", "yield",
+    "as",
+    "break",
+    "const",
+    "continue",
+    "crate",
+    "else",
+    "enum",
+    "extern",
+    "false",
+    "fn",
+    "for",
+    "if",
+    "impl",
+    "in",
+    "let",
+    "loop",
+    "match",
+    "mod",
+    "move",
+    "mut",
+    "pub",
+    "ref",
+    "return",
+    "self",
+    "Self",
+    "static",
+    "struct",
+    "super",
+    "trait",
+    "true",
+    "type",
+    "unsafe",
+    "use",
+    "where",
+    "while",
+    "dyn",
+    "async",
+    "await",
+    "abstract",
+    "become",
+    "box",
+    "do",
+    "final",
+    "macro",
+    "override",
+    "priv",
+    "typeof",
+    "unsized",
+    "virtual",
+    "yield",
 }
 
 

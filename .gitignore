@@ -5,6 +5,9 @@ build/
 dist/
 .venv/
 venv/
+.accelerate-cache/
+.pytest_cache/
+out/
 *.so
 *.dylib
 *.dll
