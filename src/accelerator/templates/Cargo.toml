@@ -9,7 +9,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pyo3 = {{ version = "0.20", features = ["extension-module"] }}
-# rug 1.24 is required by the precision shield; az is pinned to a version
-# compatible with the Cargo/Rust toolchain that ships with this package.
-rug = {{ version = "=1.24.0", features = ["integer"] }}
-az = "=1.2.1"
+{extra_deps}

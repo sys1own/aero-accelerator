@@ -9,14 +9,8 @@ from importlib import resources
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
-
-class UnsupportedError(ValueError):
-    """Raised when the source contains constructs we cannot compile."""
-
-    def __init__(self, message: str, node: Optional[ast.AST] = None) -> None:
-        super().__init__(message)
-        self.node = node
-        self.message = message
+from .._constants import IO_MODULES, IO_NAMES, MATH_ATTRS, MATH_CONSTANTS
+from ..errors import UnsupportedError
 
 
 class Engine:
@@ -63,7 +57,12 @@ class Engine:
         )
 
         crate_name = _rust_identifier(module_name)
-        cargo = cargo_template.format(crate_name=crate_name)
+        extra_deps = (
+            'rug = { version = "=1.24.0", features = ["integer"] }\n' 'az = "=1.2.1"'
+            if all_traits
+            else ""
+        )
+        cargo = cargo_template.format(crate_name=crate_name, extra_deps=extra_deps)
         lib = lib_template.format(
             shield_imports=_shield_imports(all_traits),
             functions="\n\n".join(function_blocks),
@@ -90,42 +89,9 @@ class Engine:
 class RustGenerator:
     """Convert a Python numeric function into a Rust PyO3 extension."""
 
-    IO_MODULES = {
-        "requests",
-        "urllib",
-        "socket",
-        "os",
-        "subprocess",
-        "pathlib",
-        "io",
-        "ftplib",
-        "http",
-        "sys",
-    }
-    IO_NAMES = {
-        "open",
-        "print",
-        "input",
-        "exec",
-        "eval",
-        "compile",
-        "exit",
-        "quit",
-        "__import__",
-    }
-    MATH_ATTRS = {
-        "sqrt",
-        "sin",
-        "cos",
-        "tan",
-        "exp",
-        "log",
-        "log10",
-        "ceil",
-        "floor",
-        "trunc",
-        "pow",
-    }
+    IO_MODULES = IO_MODULES
+    IO_NAMES = IO_NAMES
+    MATH_ATTRS = MATH_ATTRS
 
     def __init__(
         self,
@@ -152,9 +118,10 @@ class RustGenerator:
 
         self.assigned = self._collect_assigned()
         self._tmp_counter = 0
+        self.used_traits: Set[str] = set()
 
     def shield_traits(self) -> Set[str]:
-        return set(self.traits.get("traits", ["Integer"]))
+        return self.used_traits
 
     def emit(self) -> str:
         return self._emit_function()
@@ -243,8 +210,12 @@ class RustGenerator:
         if isinstance(stmt, ast.Pass):
             return ""
         if isinstance(stmt, ast.Expr):
-            # Stand-alone expressions are not meaningful for numeric math.
+            # Validate the expression so I/O and unsupported calls cannot
+            # slip through as ignored statements.
+            self._emit_expr(stmt.value, self.function_type)
             return ""
+        if isinstance(stmt, (ast.With, ast.AsyncWith)):
+            raise UnsupportedError("io", node=stmt)
         raise UnsupportedError(
             f"Unsupported statement: {type(stmt).__name__}", node=stmt
         )
@@ -368,8 +339,26 @@ class RustGenerator:
             return self._emit_ifexp(expr, ctx)
         if isinstance(expr, (ast.Tuple, ast.List)):
             return f"({', '.join(self._emit_expr(e, ctx) for e in expr.elts)})"
+        if isinstance(expr, ast.Attribute):
+            return self._emit_attribute(expr, ctx)
         if isinstance(expr, ast.Subscript):
             raise UnsupportedError("Subscript/indexing is not supported", node=expr)
+        raise UnsupportedError(
+            f"Unsupported expression: {type(expr).__name__}", node=expr
+        )
+
+    def _emit_attribute(self, expr: ast.Attribute, ctx: str) -> str:
+        if (
+            isinstance(expr.value, ast.Name)
+            and expr.value.id == "math"
+            and expr.attr in MATH_CONSTANTS
+        ):
+            constant = ast.Constant(
+                value=MATH_CONSTANTS[expr.attr],
+                lineno=getattr(expr, "lineno", None) or 0,
+                col_offset=getattr(expr, "col_offset", None) or 0,
+            )
+            return self._emit_constant(constant, ctx)
         raise UnsupportedError(
             f"Unsupported expression: {type(expr).__name__}", node=expr
         )

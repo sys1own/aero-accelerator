@@ -89,6 +89,13 @@ def _infer_number_type(func: ast.FunctionDef) -> str:
             return "f64"
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
             return "f64"
+        if isinstance(node, ast.Attribute):
+            if (
+                isinstance(node.value, ast.Name)
+                and node.value.id == "math"
+                and node.attr in ("pi", "e", "tau")
+            ):
+                return "f64"
         if isinstance(node, ast.Call):
             func_name = _call_name(node)
             if func_name in {
