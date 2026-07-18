@@ -6,7 +6,7 @@ The generated artifacts (`.so`, `.dylib`, or `.pyd`) act as drop-in replacements
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
 Getting started is straightforward. To compile a numeric function, point the `accelerate` CLI to your Python entry file.
 
@@ -36,7 +36,7 @@ print(slow.fib(35))
 
 ---
 
-## 🛠 Installation
+## Installation
 
 Aero-Accelerator requires a standard Rust and C toolchain.
 
@@ -66,7 +66,7 @@ pip install -e .
 
 ---
 
-## ⚙️ How it Works
+## How it Works
 
 Aero-Accelerator follows a robust, multi-stage compilation pipeline to ensure both performance and safety:
 
@@ -88,7 +88,7 @@ Aero-Accelerator follows a robust, multi-stage compilation pipeline to ensure bo
 
 ---
 
-## 📊 Command Line Reference
+## Command Line Reference
 
 | Option | Description |
 | --- | --- |
@@ -113,7 +113,7 @@ Aero-Accelerator follows a robust, multi-stage compilation pipeline to ensure bo
 
 ---
 
-## 💡 Best Practices & Supported Syntax
+## Best Practices & Supported Syntax
 
 Aero-Accelerator is optimized for numeric Python.
 
@@ -135,7 +135,7 @@ By default, functions use `i64`. The **Precision Shield** automatically promotes
 
 ---
 
-## ⚠️ Important Considerations
+## Important Considerations
 
 * **I/O Safety:** To ensure performance and safety, I/O operations (e.g., `print()`, `open()`, `requests.get()`) are not supported and will abort the build. Use `--fallback` if you need to maintain compatibility while keeping the original file structure.
 
@@ -149,7 +149,7 @@ By default, functions use `i64`. The **Precision Shield** automatically promotes
 
 ---
 
-## 🏗 CI/CD Integration
+## CI/CD Integration
 
 Aero-Accelerator is designed for automated environments. Use the `--ci` flag to suppress non-essential output and ensure clean exit codes.
 
@@ -164,6 +164,6 @@ Aero-Accelerator is designed for automated environments. Use the `--ci` flag to 
 
 ---
 
-## 📄 License
+## License
 
 MIT – See the [LICENSE](https://www.google.com/search?q=LICENSE) file for details.
