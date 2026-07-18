@@ -7,9 +7,16 @@ import shutil
 from pathlib import Path
 from typing import Optional
 
-from .scaffold.engine import UnsupportedError
-
 IO_ERROR = "Unsupported I/O operation detected. Aborting."
+
+
+class UnsupportedError(ValueError):
+    """Raised when the source contains constructs we cannot compile."""
+
+    def __init__(self, message: str, node: Optional[ast.AST] = None) -> None:
+        super().__init__(message)
+        self.node = node
+        self.message = message
 
 
 def check_toolchain() -> None:

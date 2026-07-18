@@ -20,13 +20,14 @@ from accelerator.aero_frontend import python_source_to_uast
 from accelerator.config import find_config, get, load_config
 from accelerator.errors import (
     IO_ERROR,
+    UnsupportedError,
     UserError,
     check_toolchain,
     classify_cargo_error,
     format_unsupported_error,
 )
 from accelerator.precision_shield.shield import Shield
-from accelerator.scaffold.engine import Engine, RustGenerator, UnsupportedError
+from accelerator.scaffold.engine import Engine
 from accelerator.translator import UASTToHINTranslator
 
 DEFAULT_BENCHMARK_ARG = 35
@@ -110,25 +111,6 @@ def _find_function(tree: ast.AST, name: str) -> Optional[ast.FunctionDef]:
         if isinstance(node, ast.FunctionDef) and node.name == name:
             return node
     return None
-
-
-def _contains_io(func: ast.FunctionDef) -> Tuple[bool, Optional[int]]:
-    for node in ast.walk(func):
-        if isinstance(node, (ast.With, ast.AsyncWith)):
-            return True, getattr(node, "lineno", None)
-        if isinstance(node, ast.Call):
-            if (
-                isinstance(node.func, ast.Name)
-                and node.func.id in RustGenerator.IO_NAMES
-            ):
-                return True, getattr(node, "lineno", None)
-            if (
-                isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id in RustGenerator.IO_MODULES
-            ):
-                return True, getattr(node, "lineno", None)
-    return False, None
 
 
 def _find_artifact(
@@ -277,18 +259,6 @@ def _do_build(args: argparse.Namespace, config: Dict[str, Any]) -> int:
     output_dir = _resolve_output(args, config)
     output_dir.mkdir(parents=True, exist_ok=True)
     module_name = entry.stem
-
-    # I/O detection is bypassed when the user explicitly requested a fallback.
-    if not args.fallback:
-        for name in function_names:
-            func = _find_function(tree, name)
-            has_io, line = _contains_io(func)
-            if has_io:
-                if line:
-                    print(f"{IO_ERROR} (line {line})", file=sys.stderr)
-                else:
-                    print(IO_ERROR, file=sys.stderr)
-                return 1
 
     check_toolchain()
 

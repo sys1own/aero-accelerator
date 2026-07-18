@@ -10,6 +10,9 @@ from __future__ import annotations
 import ast
 from typing import List, Optional
 
+from ._constants import IO_MODULES, IO_NAMES, MATH_CONSTANTS
+from .errors import UnsupportedError
+
 
 def python_source_to_uast(source: str) -> dict:
     """Parse Python ``source`` and return a normalized UAST ``module`` dict."""
@@ -22,7 +25,21 @@ def python_source_to_uast(source: str) -> dict:
     return {"type": "module", "children": children}
 
 
+def _is_io_call(expr: ast.Call) -> bool:
+    if isinstance(expr.func, ast.Name) and expr.func.id in IO_NAMES:
+        return True
+    if (
+        isinstance(expr.func, ast.Attribute)
+        and isinstance(expr.func.value, ast.Name)
+        and expr.func.value.id in IO_MODULES
+    ):
+        return True
+    return False
+
+
 def _lower_stmt(stmt: ast.stmt) -> Optional[dict]:
+    if isinstance(stmt, (ast.With, ast.AsyncWith)):
+        raise UnsupportedError("io", node=stmt)
     if isinstance(stmt, ast.FunctionDef):
         params = [a.arg for a in stmt.args.args]
         body = [n for n in (_lower_stmt(s) for s in stmt.body) if n is not None]
@@ -80,6 +97,8 @@ def _lower_expr(expr: Optional[ast.expr]) -> Optional[dict]:
     if isinstance(expr, ast.Name):
         return {"type": "reference", "name": expr.id}
     if isinstance(expr, ast.Call):
+        if _is_io_call(expr):
+            raise UnsupportedError("io", node=expr)
         arg = expr.args[0] if expr.args else None
         return {
             "type": "call",
@@ -135,6 +154,12 @@ def _lower_expr(expr: Optional[ast.expr]) -> Optional[dict]:
             "argument": {"type": "literal", "value": value},
         }
     if isinstance(expr, ast.Attribute):
+        if (
+            isinstance(expr.value, ast.Name)
+            and expr.value.id == "math"
+            and expr.attr in MATH_CONSTANTS
+        ):
+            return {"type": "literal", "value": MATH_CONSTANTS[expr.attr]}
         return _lower_expr(expr.value)
     return None
 
