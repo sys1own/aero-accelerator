@@ -7,7 +7,7 @@ import re
 import tempfile
 from importlib import resources
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .._constants import IO_MODULES, IO_NAMES, MATH_ATTRS, MATH_CONSTANTS
 from ..errors import UnsupportedError
@@ -139,6 +139,50 @@ class RustGenerator:
                 names.add(node.target.id)
         return names
 
+    @staticmethod
+    def _name_in_expr(expr: ast.expr, name: str) -> bool:
+        for node in ast.walk(expr):
+            if isinstance(node, ast.Name) and node.id == name:
+                return True
+        return False
+
+    def _initializers_and_body(self) -> Tuple[List[str], List[ast.stmt]]:
+        """Return `let mut` declarations and the remaining body statements.
+
+        Non-argument variables that are assigned a non-self-referential value
+        on their first top-level assignment are initialized directly, avoiding
+        a zeroed dummy declaration followed by an immediate overwrite.
+        """
+        defaults: List[str] = []
+        body = list(self.func.body)
+
+        for name in sorted(self.assigned):
+            if name in self.arg_names:
+                defaults.append(f"let mut {name} = {name};")
+                continue
+
+            for i, stmt in enumerate(body):
+                if (
+                    isinstance(stmt, ast.Assign)
+                    and len(stmt.targets) == 1
+                    and isinstance(stmt.targets[0], ast.Name)
+                    and stmt.targets[0].id == name
+                    and not self._name_in_expr(stmt.value, name)
+                ):
+                    value = self._strip_outer_parens(
+                        self._emit_expr(stmt.value, self.function_type)
+                    )
+                    defaults.append(f"let mut {name} = {value};")
+                    body.pop(i)
+                    break
+            else:
+                # No top-level initializer; declare uninitialized. The first
+                # real assignment will initialize the variable, which avoids
+                # an "assigned value is never read" warning on a dummy zero.
+                defaults.append(f"let mut {name};")
+
+        return defaults, body
+
     def _zero(self) -> str:
         return "0.0_f64" if self.function_type == "f64" else "0_i64"
 
@@ -177,14 +221,8 @@ class RustGenerator:
             f"fn {self.rust_function_name}({args}) -> {self.return_type} {{"
         )
 
-        defaults: List[str] = []
-        for name in sorted(self.assigned):
-            if name in self.arg_names:
-                defaults.append(f"let mut {name} = {name};")
-            else:
-                defaults.append(f"let mut {name} = {self._zero()};")
-
-        body_lines = [self._emit_stmt(stmt) for stmt in self.func.body]
+        defaults, body_stmts = self._initializers_and_body()
+        body_lines = [self._emit_stmt(stmt) for stmt in body_stmts]
         body = "\n".join(defaults + body_lines)
         indented = "\n".join("    " + line for line in body.splitlines())
         return f"{header}\n{indented}\n}}"
@@ -225,7 +263,10 @@ class RustGenerator:
             target = stmt.targets[0]
             if isinstance(target, ast.Name):
                 name = target.id
-                return f"{name} = {self._emit_expr(stmt.value, self.function_type)};"
+                value = self._strip_outer_parens(
+                    self._emit_expr(stmt.value, self.function_type)
+                )
+                return f"{name} = {value};"
             if isinstance(target, (ast.Tuple, ast.List)):
                 return self._emit_tuple_unpack(target, stmt.value)
 
@@ -247,7 +288,8 @@ class RustGenerator:
 
         elements = [self._emit_expr(e, self.function_type) for e in _elements(value)]
         tmp = self._next_tmp()
-        lines = [f"let {tmp} = ({', '.join(elements)});"]
+        tuple_expr = self._strip_outer_parens(f"({', '.join(elements)})")
+        lines = [f"let {tmp} = {tuple_expr};"]
         for i, name in enumerate(names):
             lines.append(f"{name} = {tmp}.{i};")
         return "\n".join(lines)
@@ -264,7 +306,8 @@ class RustGenerator:
             op=stmt.op,
             right=stmt.value,
         )
-        return f"{name} = {self._emit_binop(fake, self.function_type)};"
+        value = self._strip_outer_parens(self._emit_binop(fake, self.function_type))
+        return f"{name} = {value};"
 
     def _emit_if(self, stmt: ast.If) -> str:
         cond = self._strip_outer_parens(self._emit_expr(stmt.test, "bool"))
@@ -302,14 +345,25 @@ class RustGenerator:
             raise UnsupportedError("Only range(...) loops are supported", node=call)
         if len(call.args) == 1:
             stop = self._emit_expr(call.args[0], self.function_type)
-            range_expr = f"0..{stop}"
+            if self.function_type == "f64":
+                stop = f"({stop} as i64)"
+                range_expr = f"0_i64..{stop}"
+            else:
+                range_expr = f"0..{stop}"
         elif len(call.args) == 2:
             start = self._emit_expr(call.args[0], self.function_type)
             stop = self._emit_expr(call.args[1], self.function_type)
+            if self.function_type == "f64":
+                start = f"({start} as i64)"
+                stop = f"({stop} as i64)"
             range_expr = f"{start}..{stop}"
         else:
             raise UnsupportedError("range(...) with step is not supported", node=call)
         body = self._emit_body(stmt.body)
+        if self.function_type == "f64":
+            # The loop index is an integer, but the rest of the function expects
+            # f64. Shadow it as f64 inside the body so `return i` works.
+            body = f"    let {stmt.target.id} = {stmt.target.id} as f64;\n{body}"
         return f"for {stmt.target.id} in {range_expr} {{\n{body}\n}}"
 
     def _emit_body(self, stmts: List[ast.stmt]) -> str:
@@ -438,8 +492,12 @@ class RustGenerator:
             raise UnsupportedError(
                 "Only simple binary comparisons are supported", node=expr
             )
-        left = self._emit_expr(expr.left, ctx)
-        right = self._emit_expr(expr.comparators[0], ctx)
+        # Comparison operands are always evaluated in the function's numeric
+        # type, even when the comparison itself is used as a boolean (e.g. in
+        # an `if` or `while` condition).
+        numeric_ctx = self.function_type
+        left = self._emit_expr(expr.left, numeric_ctx)
+        right = self._emit_expr(expr.comparators[0], numeric_ctx)
         op = expr.ops[0]
         op_str = {
             ast.Eq: "==",
