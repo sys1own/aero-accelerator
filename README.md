@@ -108,23 +108,12 @@ Aero-Accelerator follows a robust, multi-stage compilation pipeline to ensure bo
 
 | Option | Description |
 | --- | --- |
-| `--entry` | Path to the source file (Required).
- |
-| `--function` | Single function to compile.
-
- |
-| `--functions` | Comma-separated list for multi-function modules.
-
- |
-| `--output` | Output directory (default `./libs`).
-
- |
-| `--fallback` | If compilation fails, generate a pure-Python wrapper instead.
-
- |
-| `--no-cache` | Force a full rebuild, ignoring the `.accelerate-cache/`.
-
- |
+| `--entry` | Path to the source file (Required). |
+| `--function` | Single function to compile. |
+| `--functions` | Comma-separated list for multi-function modules. |
+| `--output` | Output directory (default `./libs`). |
+| `--fallback` | If compilation fails, generate a pure-Python wrapper instead. |
+| `--no-cache` | Force a full rebuild, ignoring the `.accelerate-cache/`. |
 | `--no-clean` | Preserve temporary generated Rust source crates for debugging. |
 | `--verbose` | Print detailed internal AST transformation and lowering logs. |
 
