@@ -109,7 +109,6 @@ Aero-Accelerator follows a robust, multi-stage compilation pipeline to ensure bo
 | Option | Description |
 | --- | --- |
 | `--entry` | Path to the source file (Required).
-
  |
 | `--function` | Single function to compile.
 
